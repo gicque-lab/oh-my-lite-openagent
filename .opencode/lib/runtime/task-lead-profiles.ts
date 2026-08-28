@@ -6,6 +6,7 @@
  * metadata: profile name, prompt append, model fallback patterns, and optional
  * recommended models selected from the imported provider pool.
  */
+import type { LiteReasoningEffort } from "./lite-config.js";
 
 export interface ProviderModelLike {
   id: string;
@@ -30,6 +31,7 @@ export interface TaskLeadProfileDispatchConfig {
   attributePriority: string[];
   profileModelMap: Record<string, string>;
   profileFallbackModelMap: Record<string, string[]>;
+  profileReasoningEffortMap: Record<string, LiteReasoningEffort>;
   availableModels: ProviderModelLike[];
 }
 
@@ -37,6 +39,7 @@ export interface TaskLeadProfileSelection {
   profile: string;
   matchedAttribute?: string;
   recommendedModel?: string;
+  reasoningEffort?: LiteReasoningEffort;
   fallbackChain?: string[];
   fallbackPatterns?: string[];
   promptAppend?: string;
@@ -158,6 +161,15 @@ export const DEFAULT_TASK_LEAD_ATTRIBUTE_PRIORITY = [
 ] as const;
 
 export const DEFAULT_TASK_LEAD_PROFILE_NAME = "code";
+export const DEFAULT_TASK_LEAD_PROFILE_REASONING_EFFORT: Readonly<Record<string, LiteReasoningEffort>> = {
+  quick: "low",
+  code: "medium",
+  research: "low",
+  writing: "medium",
+  visual: "high",
+  deep: "xhigh",
+  "risk-high": "xhigh",
+};
 
 export function buildDefaultAttributeProfileMap(
   profiles: readonly TaskLeadProfile[] = DEFAULT_TASK_LEAD_PROFILES,
@@ -185,6 +197,7 @@ export function normalizeTaskLeadProfileDispatchConfig(
     attributePriority: input.attributePriority ?? [...DEFAULT_TASK_LEAD_ATTRIBUTE_PRIORITY],
     profileModelMap: input.profileModelMap ?? {},
     profileFallbackModelMap: input.profileFallbackModelMap ?? {},
+    profileReasoningEffortMap: input.profileReasoningEffortMap ?? {},
     availableModels: input.availableModels ?? [],
   };
 }
@@ -211,11 +224,15 @@ export function resolveTaskLeadProfileDispatch(
     ...patternFallback,
   ]);
   const recommendedModel = configuredModel ?? fallbackChain[0];
+  const reasoningEffort = config.profileReasoningEffortMap[profileName]
+    ?? DEFAULT_TASK_LEAD_PROFILE_REASONING_EFFORT[profileName]
+    ?? "medium";
 
   return {
     profile: profileName,
     ...(matchedAttribute ? { matchedAttribute } : {}),
     ...(recommendedModel ? { recommendedModel } : {}),
+    reasoningEffort,
     ...(fallbackChain.length > 0 ? { fallbackChain } : {}),
     ...(profile ? { fallbackPatterns: profile.fallbackPatterns.map((item) => item.pattern) } : {}),
     ...(profile?.promptAppend ? { promptAppend: profile.promptAppend } : {}),

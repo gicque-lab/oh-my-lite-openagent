@@ -1,4 +1,8 @@
 import { ROLE_CONTRACTS, type RoleName } from "../contracts.js";
+import {
+  normalizeSpecialistConfig,
+  type SpecialistAgentConfig,
+} from "./specialist-registry.js";
 import { DEFAULT_TASK_LEAD_PROFILES, isKnownTaskLeadProfile } from "./task-lead-profiles.js";
 import type { ProviderModel } from "./model-config.js";
 
@@ -18,6 +22,7 @@ export interface LiteOpenAgentConfig {
   roleModels: Partial<Record<RoleName, string>>;
   roleReasoningEffort: Partial<Record<RoleName, LiteReasoningEffort>>;
   taskLeadProfiles: Record<string, LiteTaskLeadProfileConfig>;
+  specialists?: Record<string, SpecialistAgentConfig>;
   modelPoolPolicy?: Record<string, unknown>;
 }
 
@@ -89,6 +94,8 @@ export function readLiteConfig(value: unknown): LiteOpenAgentConfig {
   config.roleModels = readRoleModels(input["roleModels"]);
   config.roleReasoningEffort = readRoleReasoning(input["roleReasoningEffort"]);
   config.taskLeadProfiles = readProfileConfigs(input["taskLeadProfiles"]);
+  const specialists = readSpecialists(input["specialists"]);
+  if (Object.keys(specialists).length > 0) config.specialists = specialists;
   if (isRecord(input["modelPoolPolicy"])) config.modelPoolPolicy = { ...input["modelPoolPolicy"] };
 
   return config;
@@ -98,7 +105,7 @@ export function mergeLiteConfig(
   current: LiteOpenAgentConfig,
   patch: Partial<LiteOpenAgentConfig>,
 ): LiteOpenAgentConfig {
-  return {
+  const merged: LiteOpenAgentConfig = {
     schemaVersion: patch.schemaVersion ?? current.schemaVersion ?? LITE_CONFIG_SCHEMA_VERSION,
     roleModels: {
       ...current.roleModels,
@@ -117,6 +124,12 @@ export function mergeLiteConfig(
       ...(patch.modelPoolPolicy ?? {}),
     },
   };
+  const specialists = {
+    ...(current.specialists ?? {}),
+    ...(patch.specialists ?? {}),
+  };
+  if (Object.keys(specialists).length > 0) merged.specialists = specialists;
+  return merged;
 }
 
 export function migrateLiteConfigFromOpenCodeConfig(
@@ -443,6 +456,23 @@ function readRoleModels(value: unknown): Partial<Record<RoleName, string>> {
       result[role as RoleName] = model;
     }
   }
+  return result;
+}
+
+function readSpecialists(value: unknown): Record<string, SpecialistAgentConfig> {
+  const result: Record<string, SpecialistAgentConfig> = {};
+  if (!isRecord(value)) return result;
+
+  for (const [specialistName, rawSpecialist] of Object.entries(value)) {
+    if (!isRecord(rawSpecialist)) continue;
+    const candidate = {
+      ...rawSpecialist,
+      name: typeof rawSpecialist["name"] === "string" ? rawSpecialist["name"] : specialistName,
+    };
+    const specialist = normalizeSpecialistConfig(candidate);
+    if (specialist && specialist.name === specialistName) result[specialistName] = specialist;
+  }
+
   return result;
 }
 

@@ -19,6 +19,15 @@ describe("task lead profile dispatch", () => {
     ]);
   });
 
+  it("resolves configured profile reasoning effort before the profile default", () => {
+    expect(resolveTaskLeadProfileDispatch(["risk-high"], {
+      profileReasoningEffortMap: { "risk-high": "max" },
+    })).toMatchObject({
+      profile: "risk-high",
+      reasoningEffort: "max",
+    });
+  });
+
   it("maps attributes to profiles without adding task lead agents", () => {
     const map = buildDefaultAttributeProfileMap();
 
@@ -51,6 +60,7 @@ describe("task lead profile dispatch", () => {
       profile: "code",
       matchedAttribute: "code",
       recommendedModel: "opencode/claude-sonnet-4-6",
+      reasoningEffort: "medium",
     });
     expect(dispatch.fallbackChain).toEqual([
       "opencode/claude-sonnet-4-6",

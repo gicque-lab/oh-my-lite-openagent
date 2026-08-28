@@ -95,6 +95,7 @@ describe("plugin safety", () => {
         "reasoningAssignments",
         "reasoningEffortAssignments",
         "source",
+        "specialistAssignments",
         "taskLeadProfileAssignments",
         "taskLeadProfileReasoningEffortAssignments",
       ],
@@ -349,7 +350,7 @@ describe("plugin safety", () => {
       expect(writtenLiteConfig.roleModels["command-lead"]).toBe("openai/gpt-5.4");
       expect(writtenLiteConfig.roleReasoningEffort["command-lead"]).toBe("max");
       expect(generatedAgent).toContain("model: openai/gpt-5.4");
-      expect(generatedAgent).not.toContain("reasoningEffort:");
+      expect(generatedAgent).toContain("reasoningEffort: max");
       expect(await pathExists(path.join(configDir, "opencode.json"))).toBe(false);
       expect(await pathExists(`${liteConfigPath}.bak`)).toBe(true);
     } finally {
@@ -374,7 +375,7 @@ describe("plugin safety", () => {
         { directory: process.cwd() },
         { configDir },
       );
-      await hooks.tool?.bounded_lite_model_config?.execute(
+      const output = await hooks.tool?.bounded_lite_model_config?.execute(
         {
           action: "apply",
           assignments: { "command-lead": "openai/gpt-5.4" },
@@ -422,7 +423,7 @@ describe("plugin safety", () => {
         { directory: process.cwd() },
         { configDir },
       );
-      await hooks.tool?.bounded_lite_model_config?.execute(
+      const output = await hooks.tool?.bounded_lite_model_config?.execute(
         {
           action: "apply",
           assignments: { "command-lead": "openai/gpt-5.4" },
@@ -437,7 +438,76 @@ describe("plugin safety", () => {
       const generatedAgent = await readFile(path.join(agentsDir, "command-lead.md"), "utf8");
 
       expect(generatedAgent).toContain("model: openai/gpt-5.4");
-      expect(generatedAgent).not.toContain("reasoningEffort:");
+      expect(generatedAgent).toContain("reasoningEffort: high");
+    } finally {
+      await rm(configDir, { recursive: true, force: true });
+    }
+  });
+
+  it("persists configured specialists and synchronizes Command Lead delegation at runtime", async () => {
+    const configDir = await mkdtemp(path.join(os.tmpdir(), "omo-lite-plugin-specialists-"));
+
+    try {
+      await writeFile(
+        path.join(configDir, "opencode.json"),
+        `${JSON.stringify({ agent: { "command-lead": {} } })}\n`,
+      );
+      await writeFile(
+        path.join(configDir, "oh-my-lite-openagent.json"),
+        `${JSON.stringify({
+          schemaVersion: 1,
+          roleModels: {},
+          roleReasoningEffort: {},
+          taskLeadProfiles: {},
+          specialists: {
+            "doc-sync": {
+              name: "doc-sync",
+              description: "Synchronize selected documentation.",
+              reasoningEffort: "medium",
+              editFolders: ["docs", "specs/**"],
+              prompt: "Only update documentation files under the configured folders.",
+            },
+          },
+        })}\n`,
+      );
+
+      const hooks = await createBoundedLitePlugin(
+        { directory: process.cwd() },
+        { configDir },
+      );
+      const output = await hooks.tool?.bounded_lite_model_config?.execute(
+        {
+          action: "apply",
+          assignments: { "command-lead": "openai/gpt-5.4" },
+          specialistAssignments: {
+            "doc-sync": {
+              model: "openai/gpt-5.4",
+              reasoningEffort: "high",
+            },
+          },
+          allowUnavailableModels: true,
+        },
+        { directory: process.cwd(), client: {} },
+      );
+
+      const specialist = await readFile(path.join(configDir, "agents", "doc-sync.md"), "utf8");
+      const commandLead = await readFile(path.join(configDir, "agents", "command-lead.md"), "utf8");
+      const writtenLiteConfig = JSON.parse(await readFile(path.join(configDir, "oh-my-lite-openagent.json"), "utf8"));
+
+      expect(specialist).toContain("mode: subagent");
+      expect(specialist).toContain("hidden: true");
+      expect(specialist).toContain("model: openai/gpt-5.4");
+      expect(specialist).toContain("reasoningEffort: high");
+      expect(specialist).toContain('"docs/**": allow');
+      expect(specialist).toContain('"**/docs/**": allow');
+      expect(specialist).toContain("question: deny");
+      expect(specialist).toContain("Only update documentation files");
+      expect(commandLead).toContain("doc-sync: allow");
+      expect(writtenLiteConfig.specialists["doc-sync"]).toMatchObject({
+        model: "openai/gpt-5.4",
+        reasoningEffort: "high",
+      });
+      expect(String(output)).toContain("Specialist changes applied:");
     } finally {
       await rm(configDir, { recursive: true, force: true });
     }

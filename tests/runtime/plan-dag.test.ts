@@ -59,10 +59,12 @@ describe("plan DAG runtime contract", () => {
     expect(dag.nodes.find((node) => node.id === "implement")?.dispatch).toEqual({
       profile: "fast-code-profile",
       matchedAttribute: "code",
+      reasoningEffort: "medium",
     });
     expect(dag.nodes.find((node) => node.id === "visual-check")?.dispatch).toEqual({
       profile: "vision-profile",
       matchedAttribute: "multimodal",
+      reasoningEffort: "medium",
     });
   });
 
@@ -121,6 +123,7 @@ describe("plan DAG runtime contract", () => {
   it("falls back to the default dispatch profile when no configured attribute matches", () => {
     expect(resolveDispatchProfile(["unknown"], { defaultProfile: "general" })).toEqual({
       profile: "general",
+      reasoningEffort: "medium",
     });
   });
 

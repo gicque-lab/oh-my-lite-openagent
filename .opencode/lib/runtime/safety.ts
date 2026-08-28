@@ -7,6 +7,7 @@ import {
   VISIBLE_MODES,
   type RoleName,
 } from "../contracts.js";
+import type { LiteReasoningEffort } from "./lite-config.js";
 
 export interface RuntimeProfile {
   mode: "full" | "degraded";
@@ -16,6 +17,9 @@ export interface RuntimeProfile {
   visibleModes: readonly string[];
   roleNames: readonly RoleName[];
   canonicalStates: readonly string[];
+  roleReasoningEffort?: Partial<Record<RoleName, LiteReasoningEffort>>;
+  taskLeadProfileReasoningEffort?: Record<string, LiteReasoningEffort>;
+  specialists?: string[];
 }
 
 export interface ArchitectureFinding {
@@ -29,6 +33,9 @@ export function createRuntimeProfile(input: {
   hooksEnabled: boolean;
   backgroundEnabled: boolean;
   bundledMcpEnabled: boolean;
+  roleReasoningEffort?: Partial<Record<RoleName, LiteReasoningEffort>>;
+  taskLeadProfileReasoningEffort?: Record<string, LiteReasoningEffort>;
+  specialists?: string[];
 }): RuntimeProfile {
   return {
     mode:
@@ -39,6 +46,9 @@ export function createRuntimeProfile(input: {
     visibleModes: VISIBLE_MODES,
     roleNames: ROLE_CONTRACTS.map((role) => role.name),
     canonicalStates: CANONICAL_STATES,
+    ...(input.roleReasoningEffort ? { roleReasoningEffort: input.roleReasoningEffort } : {}),
+    ...(input.taskLeadProfileReasoningEffort ? { taskLeadProfileReasoningEffort: input.taskLeadProfileReasoningEffort } : {}),
+    ...(input.specialists ? { specialists: input.specialists } : {}),
   };
 }
 

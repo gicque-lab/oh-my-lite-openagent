@@ -37,6 +37,14 @@ Follow the AI installation guide exactly.
 
 The AI installation guide lives in [`AI-INSTALL.md`](./AI-INSTALL.md).
 
+## Documentation
+
+- [`docs/SPECIALIST_AGENTS_AND_REASONING.md`](./docs/SPECIALIST_AGENTS_AND_REASONING.md) — configure specialist agents, directory-scoped permissions, models, and reasoning effort.
+- [`AI-INSTALL.md`](./AI-INSTALL.md) — AI-assisted installation and `/agent-models` workflow.
+- [`docs/ARCHITECTURE_OVERVIEW.md`](./docs/ARCHITECTURE_OVERVIEW.md) — fixed role topology, delegation, and runtime architecture.
+- [`docs/ARCHITECTURE_FLOW.md`](./docs/ARCHITECTURE_FLOW.md) — orchestration flow diagrams and lifecycle details.
+- [`.liteagent/plans/2026-08-28-FOCUS_SPECIALIST_AGENTS_AND_REASONING_IMPLEMENTATION_PLAN.md`](./.liteagent/plans/2026-08-28-FOCUS_SPECIALIST_AGENTS_AND_REASONING_IMPLEMENTATION_PLAN.md) — implementation plan and verification record for specialist/reasoning support.
+
 ## Manual Installation (Not Recommended)
 
 ### Install

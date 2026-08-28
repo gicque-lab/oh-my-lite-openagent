@@ -36,6 +36,8 @@ const OUR_ROLE_NAMES = new Set([
   "result-review",
 ]);
 const MANAGED_AGENT_NAMES = new Set([...BUILTIN_AGENT_OVERRIDES, ...OUR_ROLE_NAMES]);
+const SPECIALIST_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+const RESERVED_SPECIALIST_NAMES = new Set([...MANAGED_AGENT_NAMES]);
 
 // ---------------------------------------------------------------------------
 // Role model recommendation data (mirror of role-model-recommendations.ts)
@@ -673,6 +675,7 @@ function createDefaultLiteConfig() {
     roleModels: {},
     roleReasoningEffort: {},
     taskLeadProfiles: {},
+    specialists: {},
     modelPoolPolicy: {
       source: "all",
       allowCodexBackend: false,
@@ -704,6 +707,7 @@ function mergeLiteConfig(existingLiteConfig, existingOpenCodeConfig) {
     taskLeadProfiles: {
       ...(isRecord(existingLiteConfig?.taskLeadProfiles) ? existingLiteConfig.taskLeadProfiles : {}),
     },
+    specialists: readSpecialistConfigs(existingLiteConfig?.specialists),
     modelPoolPolicy: {
       source: "all",
       allowCodexBackend: false,
@@ -744,6 +748,75 @@ function mergeLiteConfig(existingLiteConfig, existingOpenCodeConfig) {
   }
 
   return liteConfig;
+}
+
+function readSpecialistConfigs(value) {
+  const specialists = {};
+  if (!isRecord(value)) return specialists;
+
+  for (const [specialistName, rawSpecialist] of Object.entries(value)) {
+    const specialist = normalizeSpecialistConfig(rawSpecialist, specialistName);
+    if (specialist && specialist.name === specialistName) specialists[specialistName] = specialist;
+  }
+
+  return specialists;
+}
+
+function normalizeSpecialistConfig(value, fallbackName) {
+  if (!isRecord(value)) return undefined;
+  const name = typeof value.name === "string" ? value.name : fallbackName;
+  const description = typeof value.description === "string" ? value.description.trim() : "";
+  if (!name || !SPECIALIST_NAME_PATTERN.test(name) || RESERVED_SPECIALIST_NAMES.has(name) || !description) return undefined;
+
+  const model = typeof value.model === "string" && value.model.trim().includes("/")
+    ? value.model.trim()
+    : undefined;
+  if (value.model !== undefined && !model) return undefined;
+
+  const reasoningEffort = normalizeReasoningEffort(value.reasoningEffort);
+  if (value.reasoningEffort !== undefined && !reasoningEffort) return undefined;
+
+  let editFolders;
+  if (value.editFolders !== undefined) {
+    if (!Array.isArray(value.editFolders)) return undefined;
+    editFolders = value.editFolders.map((folder) => typeof folder === "string" ? folder.trim() : "").filter(Boolean);
+    if (editFolders.length !== value.editFolders.length) return undefined;
+    if (editFolders.some((folder) => !isSafeRelativeFolder(folder))) return undefined;
+  }
+
+  const prompt = value.prompt;
+  if (prompt !== undefined && (typeof prompt !== "string" || prompt.trim() === "")) return undefined;
+  const promptFile = value.promptFile;
+  if (promptFile !== undefined && (
+    typeof promptFile !== "string" ||
+    promptFile.trim() === "" ||
+    !isSafeRelativeFilePath(promptFile)
+  )) return undefined;
+  if (value.allowBash !== undefined && typeof value.allowBash !== "boolean") return undefined;
+
+  return {
+    name,
+    description,
+    ...(model ? { model } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(editFolders ? { editFolders } : {}),
+    ...(typeof prompt === "string" ? { prompt } : {}),
+    ...(typeof promptFile === "string" ? { promptFile: promptFile.trim() } : {}),
+    allowBash: value.allowBash === true,
+  };
+}
+
+function isSafeRelativeFolder(value) {
+  const normalized = value.trim().replaceAll("\\", "/");
+  if (normalized === "*" || normalized === "**") return true;
+  if (normalized.startsWith("/") || /^[a-zA-Z]:\//.test(normalized) || normalized.startsWith("//")) return false;
+  return !normalized.split("/").some((segment) => segment === "..");
+}
+
+function isSafeRelativeFilePath(value) {
+  const normalized = value.trim().replaceAll("\\", "/");
+  if (normalized.startsWith("/") || /^[a-zA-Z]:\//.test(normalized) || normalized.startsWith("//")) return false;
+  return !normalized.split("/").some((segment) => segment === "..");
 }
 
 function readManagedPluginOptions(config) {
@@ -812,7 +885,8 @@ function mergeConfig(existingConfig, sourceConfig, configDir, options = {}) {
   const existingAgents = isRecord(existingConfig.agent) ? existingConfig.agent : {};
   const customAgents = Object.fromEntries(
     Object.entries(existingConfig.agent ?? {}).filter(([agentName]) => (
-      !MANAGED_AGENT_NAMES.has(agentName)
+      !MANAGED_AGENT_NAMES.has(agentName) &&
+      !(options.specialistNames instanceof Set && options.specialistNames.has(agentName))
     )),
   );
 
@@ -943,12 +1017,76 @@ function yamlLines(value, indent = 0) {
   return lines;
 }
 
-function agentFrontmatter(agent, liteConfig, agentName) {
+function normalizeSpecialistFolder(value) {
+  let normalized = value.trim().replaceAll("\\", "/");
+  if (normalized === "*" || normalized === "**") return normalized;
+  normalized = normalized.replace(/^\/+/, "").replace(/\/+$/, "");
+  while (normalized.endsWith("/**") || normalized.endsWith("/*")) {
+    normalized = normalized.slice(0, normalized.lastIndexOf("/"));
+  }
+  normalized = normalized.replace(/^\.\/+/, "").replace(/\/+/g, "/");
+  if (!normalized || normalized === "." || normalized === ".." || !isSafeRelativeFolder(normalized)) return undefined;
+  return normalized;
+}
+
+function generateSpecialistEditPermissions(editFolders) {
+  if (!Array.isArray(editFolders) || editFolders.length === 0) return { "*": "deny" };
+  const folders = new Set(editFolders.map((folder) => (
+    typeof folder === "string" ? normalizeSpecialistFolder(folder) : undefined
+  )).filter(Boolean));
+  if (folders.has("*") || folders.has("**")) return { "*": "allow" };
+
+  const permissions = { "*": "deny" };
+  for (const folder of folders) {
+    permissions[`${folder}/**`] = "allow";
+    permissions[`**/${folder}/**`] = "allow";
+  }
+  return permissions;
+}
+
+function specialistTaskPermissions(agent, specialistNames) {
+  if (specialistNames.length === 0) return agent;
+  const permission = isRecord(agent.permission) ? agent.permission : {};
+  const task = isRecord(permission.task) ? permission.task : {};
+  const taskWithoutCatchAll = Object.fromEntries(Object.entries(task).filter(([key]) => key !== "*"));
+  const nextTask = { "*": "deny", ...taskWithoutCatchAll };
+  for (const specialistName of specialistNames) nextTask[specialistName] = "allow";
+  return {
+    ...agent,
+    permission: {
+      ...permission,
+      task: nextTask,
+    },
+  };
+}
+
+function specialistFrontmatter(config) {
+  return {
+    mode: "subagent",
+    hidden: true,
+    description: config.description,
+    ...(config.model ? { model: config.model } : {}),
+    ...(config.reasoningEffort ? { reasoningEffort: config.reasoningEffort } : {}),
+    permission: {
+      task: { "*": "deny" },
+      question: "deny",
+      edit: generateSpecialistEditPermissions(config.editFolders),
+      bash: { "*": config.allowBash === true ? "allow" : "deny" },
+    },
+  };
+}
+
+function agentFrontmatter(agent, liteConfig, agentName, specialistNames = []) {
   const frontmatter = { ...agent };
   delete frontmatter.prompt;
+  if (agentName === "command-lead") {
+    Object.assign(frontmatter, specialistTaskPermissions(frontmatter, specialistNames));
+  }
   const model = liteConfig.roleModels[agentName];
   if (model) frontmatter.model = model;
-  delete frontmatter.reasoningEffort;
+  const reasoningEffort = liteConfig.roleReasoningEffort?.[agentName];
+  if (reasoningEffort) frontmatter.reasoningEffort = reasoningEffort;
+  else delete frontmatter.reasoningEffort;
   return yamlLines(frontmatter).join("\n");
 }
 
@@ -957,6 +1095,7 @@ async function writeManagedAgentMarkdownFiles(rootDir, configDir, liteConfig, dr
   if (!dryRun) await mkdir(targetAgentsDir, { recursive: true });
 
   const sourceAgents = isRecord(MANAGED_CONFIG.agent) ? MANAGED_CONFIG.agent : {};
+  const specialistNames = Object.keys(liteConfig.specialists ?? {});
   for (const [agentName, agent] of Object.entries(sourceAgents)) {
     if (!isRecord(agent)) continue;
     const promptRef = typeof agent.prompt === "string" ? agent.prompt.match(/^\{file:(.*)\}$/)?.[1] : undefined;
@@ -968,11 +1107,24 @@ async function writeManagedAgentMarkdownFiles(rootDir, configDir, liteConfig, dr
     }
     const targetPath = path.join(targetAgentsDir, `${agentName}.md`);
     const existingContent = await fileExists(targetPath) ? await readFile(targetPath, "utf8") : "";
-    const content = `---\n${agentFrontmatter(agent, liteConfig, agentName)}\n---\n\n${promptText.trimEnd()}\n`;
+    const content = `---\n${agentFrontmatter(agent, liteConfig, agentName, specialistNames)}\n---\n\n${promptText.trimEnd()}\n`;
     if (!dryRun) {
-      if (existingContent) {
-        await writeFile(`${targetPath}.bak`, existingContent);
-      }
+      if (existingContent) await writeFile(`${targetPath}.bak`, existingContent);
+      await writeFile(targetPath, content);
+    }
+  }
+
+  for (const [specialistName, specialist] of Object.entries(liteConfig.specialists ?? {})) {
+    const targetPath = path.join(targetAgentsDir, `${specialistName}.md`);
+    const existingContent = await fileExists(targetPath) ? await readFile(targetPath, "utf8") : "";
+    let promptText = specialist.prompt;
+    if (!promptText && specialist.promptFile) {
+      promptText = await readFile(path.resolve(rootDir, specialist.promptFile), "utf8");
+    }
+    if (!promptText) promptText = `# ${specialistName}\n\n${specialist.description}\n`;
+    const content = `---\n${yamlLines(specialistFrontmatter(specialist)).join("\n")}\n---\n\n${promptText.trimEnd()}\n`;
+    if (!dryRun) {
+      if (existingContent) await writeFile(`${targetPath}.bak`, existingContent);
       await writeFile(targetPath, content);
     }
   }
@@ -1017,12 +1169,14 @@ async function prepareInstallContext(options) {
 }
 
 function mergeAll(context) {
+  const liteConfig = mergeLiteConfig(context.existingLiteConfig, context.existingConfig);
   const mergedConfig = mergeConfig(context.existingConfig, MANAGED_CONFIG, context.configDir, {
     managedMcp: context.managedMcp,
+    specialistNames: new Set(Object.keys(liteConfig.specialists ?? {})),
   });
 
   return {
-    liteConfig: mergeLiteConfig(context.existingLiteConfig, context.existingConfig),
+    liteConfig,
     mergedConfig: injectInstallScopedCommands(mergedConfig, context),
   };
 }

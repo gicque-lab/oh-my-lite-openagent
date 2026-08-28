@@ -29,9 +29,10 @@ To preserve repository safety and prevent test regressions, the implementation m
    - Specialists cannot spawn subagents or delegate tasks, preserving the depth limit of $\le 1$.
    - Interactive prompt tool `permission.question` MUST be `"deny"` for all specialist subagents.
 
-3. **OpenCode Permission Ordering ("Last Match Wins")**:
+3. **OpenCode Permission Ordering & Directory-Scoped Dual-Expansion ("Last Match Wins")**:
+   - Users can specify any custom list of target directory folders for each specialist via `editFolders` (e.g., `["docs"]`, `["src/components", "tests/unit"]`, `["specs/**"]`, or `["*"]`).
    - For directory-scoped edit permissions, `"*": "deny"` MUST be the very first key in `permission.edit`.
-   - Folder paths must be dual-expanded (e.g., `"docs/**": "allow"` and `"**/docs/**": "allow"`) to match both root-relative and subpath executions.
+   - Every specified folder path is normalized (trimming trailing slashes and wildcard suffixes) and dual-expanded (e.g., `"docs"` becomes `"docs/**": "allow"` and `"**/docs/**": "allow"`) to ensure strict directory scoping across both root-relative and subpath execution contexts.
    - Default bash permissions for specialists must be `"*": "deny"` unless explicitly opted into safe bash capability.
 
 4. **Backward Compatibility of Runtime Profile**:
@@ -44,6 +45,7 @@ To preserve repository safety and prevent test regressions, the implementation m
 ### Phase 1 — Specialist Agent Registry & Directory-Scoped Write Permissions
 
 #### Slice 1.1: Registry Types, Validation, & Permission Normalization
+**Status: COMPLETE — 2026-08-28**
 - **Target File**: `.opencode/lib/runtime/specialist-registry.ts` (New)
 - **Data Contract**:
   ```ts
@@ -66,7 +68,11 @@ To preserve repository safety and prevent test regressions, the implementation m
   - `generateSpecialistEditPermissions(editFolders?: string[]): Record<string, string>`
     - If empty/omitted: `{ "*": "deny" }`
     - If `["*"]` or `"*"`: `{ "*": "allow" }`
-    - If specific folders: `{ "*": "deny", "<folder>/**": "allow", "**/<folder>/**": "allow", ... }` (ensuring `"*": "deny"` is the first key).
+    - If specific folders (e.g. `["docs", "src/security", "reports/**"]`):
+      - Starts with `{ "*": "deny" }` as the first entry.
+      - Normalizes each folder entry (strips leading/trailing slashes, removes trailing `/**` or `/*` to extract base directory path).
+      - Dual-expands each normalized directory: adds `<clean-dir>/**: "allow"` and `**/<clean-dir>/**: "allow"`.
+      - Preserves internal relative glob segments when custom globs are provided while normalizing trailing directory wildcards.
   - `buildSpecialistFrontmatter(config: SpecialistAgentConfig): Record<string, unknown>`
     - `mode: "subagent"`
     - `hidden: true`
@@ -74,8 +80,19 @@ To preserve repository safety and prevent test regressions, the implementation m
     - `model?: config.model`
     - `reasoningEffort?: config.reasoningEffort`
     - `permission: { task: { "*": "deny" }, question: "deny", edit: ..., bash: ... }`
+- **Completed implementation**:
+  - Added strict specialist identifier and configuration validation, including reserved-name collision guards and safe relative folder/prompt paths.
+  - Added normalized specialist configuration handling and OpenCode frontmatter generation with leaf-worker delegation and question denials.
+  - Added `tests/runtime/specialist-registry.test.ts` covering 14 unit cases for validation, folder selection, dual expansion, permission ordering, deduplication, and frontmatter invariants.
+- **Verification record**:
+  - `npm test -- tests/runtime/specialist-registry.test.ts` — passed (14 tests).
+  - `npm run typecheck` — passed.
+  - `npm test` — passed (179 tests across 19 files).
+  - `npm run build` — passed.
+  - `node scripts/install.mjs --dry-run` — passed; no files were written.
 
 #### Slice 1.2: Config Schema Integration & Dynamic Frontmatter Generation
+**Status: COMPLETE — 2026-08-28**
 - **Target Files**:
   - `.opencode/lib/runtime/lite-config.ts` (Edit)
   - `scripts/install.mjs` (Edit)
@@ -96,20 +113,29 @@ To preserve repository safety and prevent test regressions, the implementation m
     - Read `liteConfig.specialists` and generate `.opencode/agents/<specialist-name>.md` files.
     - When generating `.opencode/agents/command-lead.md`, dynamically inject `permission.task.<specialist-name>: "allow"` into the frontmatter.
     - Keep `scripts/managed-config.mjs` completely untouched.
+- **Verification record**:
+  - `tests/runtime/lite-config-specialists.test.ts` and `tests/runtime/install-jsonc.test.ts` passed.
+  - Installer/config coverage passed as part of the final 190-test regression suite.
+  - `node scripts/install.mjs --dry-run` passed without writing files.
 
 #### Slice 1.3: Plugin Runtime Integration & Prompt Documentation
+**Status: COMPLETE — 2026-08-28**
 - **Target Files**:
   - `.opencode/plugins/bounded-lite.ts` (Edit)
   - `.opencode/agents/command-lead.md` (Edit)
 - **Implementation**:
   - In `bounded-lite.ts`, update `updateGeneratedAgentMarkdownFiles` to persist specialist markdown files and sync `command-lead.md` task permissions.
   - In `command-lead.md`, add explicit routing instructions for delegating bounded tasks to registered dynamic specialists when requested by the user or plan.
+- **Verification record**:
+  - `tests/runtime/plugin-load.test.ts` and `tests/runtime/specialist-permissions.test.ts` passed.
+  - Runtime generation verifies hidden leaf-worker frontmatter, scoped edit permissions, and Command Lead delegation.
 
 ---
 
 ### Phase 2 — Thinking Effort Configuration & Dynamic DAG Dispatch
 
 #### Slice 2.1: Dynamic Lite Config Loading in DAG Dispatch & Readiness Gates
+**Status: COMPLETE — 2026-08-28**
 - **Target Files**:
   - `.opencode/lib/runtime/task-lead-profiles.ts` (Edit)
   - `.opencode/lib/runtime/plan-dag.ts` (Edit)
@@ -130,8 +156,12 @@ To preserve repository safety and prevent test regressions, the implementation m
   - In `task-lead-profiles.ts`, update `TaskLeadProfileDispatchConfig` and `resolveTaskLeadProfileDispatch` to resolve and attach configured or default reasoning effort.
   - In `plan-dag.ts`, ensure `TaskDAGNode.dispatch` includes `reasoningEffort`.
   - In `bounded-lite.ts`, modify `bounded_lite_plan_dag` and `bounded_lite_plan_readiness` to execute `await readLiteConfigFile(options.configDir)` at runtime, dynamically incorporating user changes made via `/agent-models`.
+- **Verification record**:
+  - `tests/runtime/task-lead-profiles.test.ts` and `tests/runtime/plan-dag.test.ts` passed.
+  - `tests/runtime/reasoning-effort-dag.test.ts` verified live config reload for both DAG and readiness dispatch.
 
 #### Slice 2.2: Markdown Frontmatter Synchronization & Runtime Profile Reporting
+**Status: COMPLETE — 2026-08-28**
 - **Target Files**:
   - `.opencode/plugins/bounded-lite.ts` (Edit)
   - `scripts/install.mjs` (Edit)
@@ -156,8 +186,12 @@ To preserve repository safety and prevent test regressions, the implementation m
     }
     ```
   - In `bounded-lite.ts`, have `bounded_lite_runtime_profile` populate these additive fields from the effective config.
+- **Verification record**:
+  - `tests/runtime/plugin-load.test.ts` verified persisted and omitted reasoning-effort frontmatter behavior.
+  - Runtime profile and conformance/degraded-mode suites passed with additive fields.
 
 #### Slice 2.3: Model Config Tool Enhancement
+**Status: COMPLETE — 2026-08-28**
 - **Target Files**:
   - `.opencode/lib/runtime/model-config.ts` (Edit)
   - `.opencode/plugins/bounded-lite.ts` (Edit)
@@ -166,12 +200,16 @@ To preserve repository safety and prevent test regressions, the implementation m
     - `action: "list"`: Output summary of role models, role reasoning efforts, Task Lead profiles, and registered specialists.
     - `action: "auto"`: Output recommended reasoning efforts alongside model recommendations.
     - `action: "apply"`: Accept optional `specialistAssignments` to configure model and reasoning effort on registered specialist agents.
+- **Verification record**:
+  - `tests/runtime/model-config.test.ts` passed specialist summaries, validation, assignment, and warning cases.
+  - `tests/runtime/plugin-load.test.ts` verified `specialistAssignments` persistence and generated markdown synchronization.
 
 ---
 
 ### Phase 3 — Verification & Testing Strategy
 
 #### Slice 3.1: Unit & Integration Tests
+**Status: COMPLETE — 2026-08-28**
 - **New Test Files**:
   - `tests/runtime/specialist-registry.test.ts`:
     - Schema validation, name collision guards (cannot collide with 8 core roles or `build`/`plan`).
@@ -190,10 +228,20 @@ To preserve repository safety and prevent test regressions, the implementation m
   - `tests/config/permissions.test.ts` (Must remain 100% passing)
   - `tests/integration/conformance.test.ts` (Must remain 100% passing)
   - `tests/integration/degraded-mode.test.ts` (Must remain 100% passing)
+- **Verification record**:
+  - Added and passed `tests/runtime/specialist-permissions.test.ts` (2 tests).
+  - Added and passed `tests/runtime/reasoning-effort-dag.test.ts` (1 test).
+  - Full suite passed: 190 tests across 22 files.
 
 #### Slice 3.2: Full Regression & Gate Verification
+**Status: COMPLETE — 2026-08-28**
 Execute full validation commands:
 1. `npm run typecheck`
 2. `npm test`
 3. `npm run build`
 4. `node scripts/install.mjs --dry-run`
+- **Verification record**:
+  - `npm run typecheck` — passed.
+  - `npm test` — passed (190 tests across 22 files).
+  - `npm run build` — passed.
+  - `node scripts/install.mjs --dry-run` — passed; no files were written.

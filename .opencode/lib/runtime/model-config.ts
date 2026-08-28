@@ -8,6 +8,12 @@ import {
   formatAutoModelReport,
 } from "./role-model-recommendations.js";
 import {
+  normalizeLiteReasoningEffort,
+  type LiteOpenAgentConfig,
+  type LiteReasoningEffort,
+} from "./lite-config.js";
+import type { SpecialistAgentConfig } from "./specialist-registry.js";
+import {
   DEFAULT_TASK_LEAD_PROFILES,
   formatTaskLeadProfileModelReport,
   isKnownTaskLeadProfile,
@@ -39,6 +45,31 @@ export interface RoleModelSummary {
   effectiveModel?: string;
   configuredReasoningEffort?: ReasoningEffort;
   inheritsGlobal: boolean;
+}
+
+export interface SpecialistModelSummary {
+  name: string;
+  description: string;
+  configuredModel?: string;
+  configuredReasoningEffort?: LiteReasoningEffort;
+  editFolders: string[];
+  allowBash: boolean;
+}
+
+export interface ApplySpecialistAssignmentResult {
+  changed: Array<{
+    specialist: string;
+    model?: string;
+    reasoningEffort?: LiteReasoningEffort;
+  }>;
+  skipped: Array<{
+    specialist: string;
+    reason: string;
+  }>;
+  warnings: Array<{
+    specialist: string;
+    warning: string;
+  }>;
 }
 
 export interface TaskLeadProfileModelSummary {
@@ -179,6 +210,7 @@ export function listProviderModels(config: Record<string, unknown>): ProviderMod
       }
     }
   }
+
 
   // Strategy 2: Read models from agent config (infer from what's already assigned)
   // This catches cases where providers were connected via /connect but their
@@ -436,6 +468,108 @@ export function summarizeTaskLeadProfileModels(config: Record<string, unknown>):
   });
 }
 
+export function summarizeSpecialists(
+  config: LiteOpenAgentConfig | Record<string, unknown>,
+): SpecialistModelSummary[] {
+  const rawSpecialists = isRecord(config.specialists) ? config.specialists : {};
+
+  return Object.entries(rawSpecialists).flatMap(([name, rawSpecialist]) => {
+    if (!isRecord(rawSpecialist)) return [];
+    const description = typeof rawSpecialist["description"] === "string"
+      ? rawSpecialist["description"]
+      : "";
+    const configuredModel = typeof rawSpecialist["model"] === "string"
+      ? rawSpecialist["model"]
+      : undefined;
+    const configuredReasoningEffort = normalizeLiteReasoningEffort(rawSpecialist["reasoningEffort"]);
+    const editFolders = readStringArray(rawSpecialist["editFolders"]);
+
+    return [{
+      name,
+      description,
+      ...(configuredModel ? { configuredModel } : {}),
+      ...(configuredReasoningEffort ? { configuredReasoningEffort } : {}),
+      editFolders,
+      allowBash: rawSpecialist["allowBash"] === true,
+    }];
+  });
+}
+
+export function applySpecialistAssignments(
+  liteConfig: LiteOpenAgentConfig,
+  assignments: Record<string, unknown>,
+  availableModelIds: readonly string[] = [],
+  options: { allowUnavailableModels?: boolean } = {},
+): ApplySpecialistAssignmentResult {
+  const changed: ApplySpecialistAssignmentResult["changed"] = [];
+  const skipped: ApplySpecialistAssignmentResult["skipped"] = [];
+  const warnings: ApplySpecialistAssignmentResult["warnings"] = [];
+  const availableModels = new Set(availableModelIds);
+
+  for (const [specialistName, rawAssignment] of Object.entries(assignments)) {
+    const existing = liteConfig.specialists?.[specialistName];
+    if (!existing) {
+      skipped.push({ specialist: specialistName, reason: "specialist is not registered" });
+      continue;
+    }
+
+    const assignment = typeof rawAssignment === "string"
+      ? { model: rawAssignment }
+      : isRecord(rawAssignment)
+        ? rawAssignment
+        : {};
+    const modelValue = assignment["model"];
+    const model = modelValue === undefined
+      ? undefined
+      : typeof modelValue === "string" && modelValue.trim().includes("/")
+        ? modelValue.trim()
+        : undefined;
+    if (modelValue !== undefined && !model) {
+      skipped.push({ specialist: specialistName, reason: "model must use provider/model format" });
+      continue;
+    }
+    if (model && availableModels.size === 0 && !options.allowUnavailableModels) {
+      skipped.push({ specialist: specialistName, reason: "no imported model pool is available" });
+      continue;
+    }
+    if (model && availableModels.size > 0 && !availableModels.has(model)) {
+      if (!options.allowUnavailableModels) {
+        skipped.push({ specialist: specialistName, reason: "model is not in the imported model pool" });
+        continue;
+      }
+      warnings.push({
+        specialist: specialistName,
+        warning: "model was not found in the provider list; writing it anyway",
+      });
+    }
+
+    const effortValue = assignment["reasoningEffort"];
+    const reasoningEffort = effortValue === undefined
+      ? undefined
+      : normalizeLiteReasoningEffort(effortValue);
+    if (effortValue !== undefined && !reasoningEffort) {
+      skipped.push({ specialist: specialistName, reason: "reasoningEffort is not supported" });
+      continue;
+    }
+    if (!model && !reasoningEffort) {
+      skipped.push({ specialist: specialistName, reason: "assignment requires model or reasoningEffort" });
+      continue;
+    }
+
+    const next: SpecialistAgentConfig = { ...existing };
+    if (model) next.model = model;
+    if (reasoningEffort) next.reasoningEffort = reasoningEffort;
+    liteConfig.specialists![specialistName] = next;
+    changed.push({
+      specialist: specialistName,
+      ...(model ? { model } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+    });
+  }
+
+  return { changed, skipped, warnings };
+}
+
 export function applyRoleModelConfig(
   config: Record<string, unknown>,
   assignments: Record<string, unknown>,
@@ -621,6 +755,7 @@ export function formatModelConfigReport(input: {
   roles: RoleModelSummary[];
   models: ProviderModel[];
   taskLeadProfiles?: TaskLeadProfileModelSummary[];
+  specialists?: SpecialistModelSummary[];
   changed?: ApplyModelConfigResult["changed"];
   skipped?: ApplyModelConfigResult["skipped"];
   warnings?: ApplyModelConfigResult["warnings"];
@@ -629,6 +764,9 @@ export function formatModelConfigReport(input: {
   profileWarnings?: ApplyTaskLeadProfileModelConfigResult["warnings"];
   reasoningChanged?: ApplyRoleReasoningEffortConfigResult["changed"];
   reasoningSkipped?: ApplyRoleReasoningEffortConfigResult["skipped"];
+  specialistChanged?: ApplySpecialistAssignmentResult["changed"];
+  specialistSkipped?: ApplySpecialistAssignmentResult["skipped"];
+  specialistWarnings?: ApplySpecialistAssignmentResult["warnings"];
 }): string {
   const lines = [
     "Oh My Lite OpenAgent role model configuration",
@@ -727,9 +865,47 @@ export function formatModelConfigReport(input: {
     );
   }
 
+
+  if (input.specialists) {
+    lines.push("", "Registered specialists:");
+    lines.push(...(
+      input.specialists.length > 0
+        ? input.specialists.map((specialist) => {
+          const model = specialist.configuredModel ?? "<unset>";
+          const effort = specialist.configuredReasoningEffort
+            ? ` reasoningEffort=${specialist.configuredReasoningEffort}`
+            : "";
+          const folders = specialist.editFolders.length > 0
+            ? ` editFolders=${specialist.editFolders.join(",")}`
+            : " editFolders=<none>";
+          return `- ${specialist.name}: ${model}${effort}${folders} bash=${specialist.allowBash ? "allowed" : "denied"}`;
+        })
+        : ["- <none>"]
+    ));
+  }
   if (input.reasoningSkipped && input.reasoningSkipped.length > 0) {
     lines.push("", "Reasoning effort skipped:");
     lines.push(...input.reasoningSkipped.map((item) => `- ${item.role}: ${item.reason}`));
+  }
+  if (input.specialistChanged) {
+    lines.push("", "Specialist changes applied:");
+    lines.push(...(
+      input.specialistChanged.length > 0
+        ? input.specialistChanged.map((change) => (
+          `- ${change.specialist}: ${change.model ?? "<model unchanged>"}${change.reasoningEffort ? ` reasoningEffort=${change.reasoningEffort}` : ""}`
+        ))
+        : ["- <none>"]
+    ));
+  }
+
+  if (input.specialistSkipped && input.specialistSkipped.length > 0) {
+    lines.push("", "Specialist assignments skipped:");
+    lines.push(...input.specialistSkipped.map((item) => `- ${item.specialist}: ${item.reason}`));
+  }
+
+  if (input.specialistWarnings && input.specialistWarnings.length > 0) {
+    lines.push("", "Specialist warnings:");
+    lines.push(...input.specialistWarnings.map((item) => `- ${item.specialist}: ${item.warning}`));
   }
 
   return lines.join("\n");
