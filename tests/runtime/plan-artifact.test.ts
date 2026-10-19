@@ -8,6 +8,7 @@ import {
   sanitizeSlug,
   writePlanArtifact,
 } from "../../.opencode/lib/runtime/plan-artifact.js";
+import { assertPlanArtifactWriteArgs } from "../../.opencode/lib/runtime/tool-contracts.js";
 
 describe("plan artifact persistence", () => {
   it("writes plans under .liteagent/plans and appends the index", async () => {
@@ -44,5 +45,42 @@ describe("plan artifact persistence", () => {
   it("normalizes non-ascii or unsafe slugs to a safe fallback", () => {
     expect(sanitizeSlug("修复 模型导入!")).toBe("plan");
     expect(sanitizeSlug("Agent Models Import Fix")).toBe("agent-models-import-fix");
+  });
+});
+
+describe("plan artifact write guard", () => {
+  it("keeps markdown and content aliases accepted and resolves markdown first", () => {
+    expect(assertPlanArtifactWriteArgs({ title: "T", markdown: "# m" })).toEqual({ title: "T", markdown: "# m" });
+    expect(assertPlanArtifactWriteArgs({ title: "T", content: "# c" })).toEqual({ title: "T", markdown: "# c" });
+    expect(assertPlanArtifactWriteArgs({ title: "T", markdown: "# m", content: "# c" }))
+      .toEqual({ title: "T", markdown: "# m" });
+  });
+
+  it("fails title-only input with the documented cross-field rule before any write", () => {
+    expect(() => assertPlanArtifactWriteArgs({ title: "T" }))
+      .toThrow(/provide "markdown" or its alias "content".*before any file write/s);
+    expect(() => assertPlanArtifactWriteArgs({ title: "T", markdown: 42, content: undefined }))
+      .toThrow(/document text/);
+    expect(() => assertPlanArtifactWriteArgs({ title: "T", markdown: "   " }))
+      .toThrow(/document text/);
+  });
+
+  it("gives specific diagnostics for title, action and enum errors", () => {
+    expect(() => assertPlanArtifactWriteArgs({ markdown: "# m" }))
+      .toThrow(/non-empty string "title"/);
+    expect(() => assertPlanArtifactWriteArgs({ title: 42, markdown: "# m" }))
+      .toThrow(/non-empty string "title".*received number/s);
+    expect(() => assertPlanArtifactWriteArgs({ title: "T", markdown: "# m", action: "delete" }))
+      .toThrow(/action must be "write".*"delete"/s);
+    expect(() => assertPlanArtifactWriteArgs({ title: "T", markdown: "# m", artifactKind: "memo" }))
+      .toThrow(/"artifactKind" must be one of "plan-skeleton" \| "detailed-plan".*"memo"/s);
+    expect(() => assertPlanArtifactWriteArgs({ title: "T", markdown: "# m", status: "published" }))
+      .toThrow(/"status" must be one of "draft" \| "reviewed" \| "blocked".*"published"/s);
+  });
+
+  it("keeps the guard pure: it performs no filesystem or config work", () => {
+    // Calling the guard without a project root or config must not throw for
+    // valid input — it never touches I/O; writes happen in writePlanArtifact.
+    expect(() => assertPlanArtifactWriteArgs({ title: "Pure", content: "# ok" })).not.toThrow();
   });
 });

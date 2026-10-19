@@ -10,20 +10,11 @@ import {
   type TaskLeadProfileSelection,
 } from "./task-lead-profiles.js";
 import type { LiteReasoningEffort } from "./lite-config.js";
+import { describePlanPayloadFormatError, type PlanSubtask } from "../artifacts/schema.js";
 
-export interface PlanSubtask {
-  id: string;
-  depends_on: string[];
-  attributes: string[];
-  deliverable: string;
-  description: string;
-}
-
-export interface PlanFilePayload {
-  plan: {
-    subtasks: PlanSubtask[];
-  };
-}
+// Re-exported so runtime consumers keep one import path; the contract itself
+// lives in artifacts/plan-payload.ts via artifacts/schema.ts (no second shape).
+export type { PlanSubtask };
 
 export interface TaskDispatchConfig {
   concurrency: number;
@@ -247,7 +238,9 @@ export function inferExecutionWaves(subtasks: readonly PlanSubtask[]): string[][
 
 function extractSubtasks(payload: unknown, errors: string[]): PlanSubtask[] {
   if (!isRecord(payload)) {
-    errors.push("payload must be an object with plan.subtasks.");
+    // One actionable format diagnostic (with example) instead of an opaque
+    // type error; direct runtime callers receive the same message as tools.
+    errors.push(describePlanPayloadFormatError(payload));
     return [];
   }
 

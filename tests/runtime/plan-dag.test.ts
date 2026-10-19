@@ -147,3 +147,49 @@ describe("plan DAG runtime contract", () => {
     });
   });
 });
+
+describe("plan DAG input-format boundary", () => {
+  it("rejects non-object payloads with the shared format diagnostic and example", () => {
+    for (const [badInput, pattern] of [
+      [undefined, /Missing `payload`/],
+      [null, /`payload` is null/],
+      [["a"], /must be a single structured object, not an array/],
+      ["# Plan\nmarkdown", /raw Markdown document/],
+      [JSON.stringify(validPlan), /JSON-encoded string/],
+      [3, /received number/],
+    ] as const) {
+      const errors = validatePlanPayload(badInput);
+
+      expect(errors.valid).toBe(false);
+      expect(errors.errors).toHaveLength(1);
+      expect(errors.errors[0]).toMatch(pattern);
+      expect(errors.errors[0]).toContain("Expected the named `payload` object");
+      expect(errors.subtasks).toEqual([]);
+    }
+  });
+
+  it("throws the actionable format diagnostic from buildTaskDAG for malformed payloads", () => {
+    expect(() => buildTaskDAG("# raw markdown plan")).toThrow(/raw Markdown document/);
+    expect(() => buildTaskDAG(JSON.stringify(validPlan))).toThrow(/JSON-encoded string/);
+    expect(() => buildTaskDAG(undefined)).toThrow(/Missing `payload`/);
+  });
+
+  it("accepts DAG-only payloads without readiness metadata", () => {
+    const dag = buildTaskDAG({
+      plan: {
+        subtasks: [
+          {
+            id: "only",
+            depends_on: [],
+            attributes: ["code"],
+            deliverable: "DAG-only proof",
+            description: "plan.subtasks without readiness metadata is enough",
+          },
+        ],
+      },
+    });
+
+    expect(dag.waves).toEqual([["only"]]);
+    expect(dag.nodes[0]!.dispatch).toMatchObject({ profile: "code" });
+  });
+});

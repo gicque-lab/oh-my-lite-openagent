@@ -10,6 +10,10 @@ import { buildTaskDAG, type TaskDispatchConfig } from "../lib/runtime/plan-dag.j
 import { parseJsonConfig } from "../lib/runtime/jsonc.js";
 import { validatePlanReadiness } from "../lib/runtime/plan-readiness.js";
 import { writePlanArtifact } from "../lib/runtime/plan-artifact.js";
+import {
+  assertPlanArtifactWriteArgs,
+  planToolArgsShape,
+} from "../lib/runtime/tool-contracts.js";
 import { createRuntimeProfile } from "../lib/runtime/safety.js";
 import {
   buildSpecialistFrontmatter,
@@ -1337,10 +1341,7 @@ export async function createBoundedLitePlugin(
       },
       bounded_lite_plan_dag: {
         description: "Validate a required plan.subtasks payload and return bounded DAG waves plus dispatch profiles.",
-        args: {
-          payload: tool.schema.unknown(),
-          dispatch: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
-        },
+        args: planToolArgsShape,
         async execute(args) {
           const payload = args["payload"];
           const runtime = await readRuntimeLiteConfig(options.configDir);
@@ -1355,10 +1356,7 @@ export async function createBoundedLitePlugin(
       },
       bounded_lite_plan_readiness: {
         description: "Validate a Plan Builder artifact against readiness gates before Command Lead dispatches execution.",
-        args: {
-          payload: tool.schema.unknown(),
-          dispatch: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
-        },
+        args: planToolArgsShape,
         async execute(args) {
           const payload = args["payload"];
           const runtime = await readRuntimeLiteConfig(options.configDir);
@@ -1374,33 +1372,26 @@ export async function createBoundedLitePlugin(
       bounded_lite_plan_artifact: {
         description: "Persist a Command Lead-approved plan artifact under .liteagent/plans and append .liteagent/plan-index.jsonl.",
         args: {
-          title: tool.schema.string(),
-          markdown: tool.schema.string().optional(),
-          content: tool.schema.string().optional(),
-          action: tool.schema.string().optional(),
-          planId: tool.schema.string().optional(),
-          plan_id: tool.schema.string().optional(),
-          maturityLevel: tool.schema.string().optional(),
-          maturity_level: tool.schema.string().optional(),
-          generatedBy: tool.schema.string().optional(),
-          generated_by: tool.schema.string().optional(),
-          path: tool.schema.string().optional(),
-          recommended_plan_path: tool.schema.string().optional(),
-          artifactKind: tool.schema.string().optional(),
-          status: tool.schema.string().optional(),
-          overwrite: tool.schema.boolean().optional(),
+          title: tool.schema.string().describe('Required non-empty plan title, e.g. "Router Threshold Fix".'),
+          markdown: tool.schema.string().describe("Required plan document text. Cross-field rule: provide exactly the document text via `markdown` or its alias `content`; title-only calls fail before any file write.").optional(),
+          content: tool.schema.string().describe("Alias for `markdown` (either alias may carry the document text; title-only calls fail before any file write).").optional(),
+          action: tool.schema.enum(["write"]).describe("Only \"write\" is supported.").optional(),
+          planId: tool.schema.string().describe("Optional explicit plan id; aliases: planId / plan_id.").optional(),
+          plan_id: tool.schema.string().describe("Alias of planId.").optional(),
+          maturityLevel: tool.schema.string().describe('Optional maturity level, e.g. "M3"; aliases: maturityLevel / maturity_level.').optional(),
+          maturity_level: tool.schema.string().describe("Alias of maturityLevel.").optional(),
+          generatedBy: tool.schema.string().describe('Optional generating role, e.g. "deep-plan-builder"; aliases: generatedBy / generated_by.').optional(),
+          generated_by: tool.schema.string().describe("Alias of generatedBy.").optional(),
+          path: tool.schema.string().describe('Optional path under .liteagent/plans, e.g. "2026-04-25-my-plan.md"; aliases: path / recommended_plan_path.').optional(),
+          recommended_plan_path: tool.schema.string().describe("Alias of path.").optional(),
+          artifactKind: tool.schema.enum(["plan-skeleton", "detailed-plan"]).describe('Plan artifact kind; defaults to "plan-skeleton".').optional(),
+          status: tool.schema.enum(["draft", "reviewed", "blocked"]).describe('Plan status recorded in the index; defaults to "draft".').optional(),
+          overwrite: tool.schema.boolean().describe("Overwrite an existing plan file (default false).").optional(),
         },
         async execute(args, context) {
-          const action = readString(args["action"]) ?? "write";
-          if (action !== "write") {
-            throw new Error("bounded_lite_plan_artifact action must be write.");
-          }
-
-          const title = readString(args["title"]);
-          const markdown = readString(args["markdown"]) ?? readString(args["content"]);
-          if (!title || !markdown) {
-            throw new Error("bounded_lite_plan_artifact write requires title and markdown.");
-          }
+          // Cross-field validation (title + one of markdown/content, action and
+          // enums) runs here, before any I/O side effect.
+          const { title, markdown } = assertPlanArtifactWriteArgs(args);
 
           const planId = readString(args["planId"]) ?? readString(args["plan_id"]);
           const maturityLevel = readString(args["maturityLevel"]) ?? readString(args["maturity_level"]);

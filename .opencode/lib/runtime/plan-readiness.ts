@@ -1,4 +1,5 @@
 import { buildTaskDAG, type TaskDAG, type TaskDispatchConfig } from "./plan-dag.js";
+import { describePlanPayloadFormatError } from "../artifacts/schema.js";
 
 export type PlanReadinessDecision = "execute" | "revise" | "blocked";
 
@@ -25,6 +26,19 @@ export function validatePlanReadiness(
 ): PlanReadinessResult {
   const errors: string[] = [];
   const warnings: string[] = [];
+
+  // Reject bad input formats once with one actionable diagnostic instead of a
+  // misleading cascade of missing-section errors (raw Markdown, JSON-encoded
+  // strings, arrays, null are never parsed or guessed at).
+  if (!isRecord(payload)) {
+    return {
+      executable: false,
+      decision: "revise",
+      errors: [describePlanPayloadFormatError(payload)],
+      warnings,
+    };
+  }
+
   const plan = normalizePlanPayload(payload);
 
   const schemaVersion = readField(plan, "plan_schema_version");
@@ -80,10 +94,6 @@ export function validatePlanReadiness(
     errors.push(error instanceof Error ? error.message : String(error));
   }
 
-  if (payload === plan.payload && typeof payload === "string") {
-    warnings.push("raw markdown plans must include a structured plan payload for DAG validation.");
-  }
-
   return {
     executable: errors.length === 0,
     decision: errors.length === 0 ? "execute" : status === "blocked" ? "blocked" : "revise",
@@ -100,28 +110,14 @@ interface NormalizedPlanPayload {
   frontmatter: Record<string, string>;
 }
 
-function normalizePlanPayload(payload: unknown): NormalizedPlanPayload {
-  if (typeof payload === "string") {
-    return {
-      payload,
-      frontmatter: parseFrontmatter(payload),
-    };
-  }
-
-  if (isRecord(payload)) {
-    const frontmatter = isRecord(payload["frontmatter"]) ? stringifyRecord(payload["frontmatter"]) : {};
-    return {
-      payload,
-      frontmatter: {
-        ...frontmatter,
-        ...stringifyRecord(payload),
-      },
-    };
-  }
-
+function normalizePlanPayload(payload: Record<string, unknown>): NormalizedPlanPayload {
+  const frontmatter = isRecord(payload["frontmatter"]) ? stringifyRecord(payload["frontmatter"]) : {};
   return {
     payload,
-    frontmatter: {},
+    frontmatter: {
+      ...frontmatter,
+      ...stringifyRecord(payload),
+    },
   };
 }
 
@@ -199,22 +195,6 @@ function hasContent(value: unknown): boolean {
   if (isRecord(value)) return Object.keys(value).length > 0;
 
   return value !== undefined && value !== null;
-}
-
-function parseFrontmatter(markdown: string): Record<string, string> {
-  const lines = markdown.split(/\r?\n/);
-  if (lines[0]?.trim() !== "---") return {};
-
-  const result: Record<string, string> = {};
-
-  for (const line of lines.slice(1)) {
-    if (line.trim() === "---") break;
-
-    const match = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
-    if (match?.[1]) result[match[1]] = match[2]?.trim() ?? "";
-  }
-
-  return result;
 }
 
 function stringifyRecord(value: Record<string, unknown>): Record<string, string> {

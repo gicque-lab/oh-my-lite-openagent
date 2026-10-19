@@ -1,8 +1,10 @@
 import { createBoundedLitePlugin } from "../../.opencode/plugins/bounded-lite.js";
 import { tool } from "@opencode-ai/plugin";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { z } from "zod";
+import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 async function pathExists(filePath: string): Promise<boolean> {
   try {
@@ -11,6 +13,12 @@ async function pathExists(filePath: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+const PLAN_FIXTURES_DIR = fileURLToPath(new URL("../fixtures/plans/", import.meta.url));
+
+async function loadStructuredPlanFixture(): Promise<Record<string, unknown>> {
+  return JSON.parse(await readFile(path.join(PLAN_FIXTURES_DIR, "structured-plan.json"), "utf8"));
 }
 
 describe("plugin safety", () => {
@@ -131,18 +139,27 @@ describe("plugin safety", () => {
     expect(routeSchema.safeParse({}).success).toBe(false);
     expect(routeSchema.safeParse({ category: 123 }).success).toBe(false);
 
-    // 2. bounded_lite_plan_dag: opaque payload, optional dispatch
+    // 2. bounded_lite_plan_dag: object-only payload (required), optional dispatch.
+    //    Raw strings, arrays, null and missing payload are rejected at the wire.
     const planDagSchema = tool.schema.object(tools.bounded_lite_plan_dag?.args as Record<string, any>);
     expect(planDagSchema.safeParse({ payload: { plan: { subtasks: [] } } }).success).toBe(true);
-    expect(planDagSchema.safeParse({ payload: "raw-string-plan", dispatch: { concurrency: 4 } }).success).toBe(true);
-    expect(planDagSchema.safeParse({ payload: "plan-string" }).success).toBe(true);
+    expect(planDagSchema.safeParse({ payload: { plan: { subtasks: [] } }, dispatch: { concurrency: 4 } }).success).toBe(true);
+    expect(planDagSchema.safeParse({ payload: "raw-string-plan" }).success).toBe(false);
+    expect(planDagSchema.safeParse({ payload: ["not", "an", "object"] }).success).toBe(false);
+    expect(planDagSchema.safeParse({ payload: null }).success).toBe(false);
+    expect(planDagSchema.safeParse({}).success).toBe(false);
 
-    // 3. bounded_lite_plan_readiness: opaque payload, optional dispatch
+    // 3. bounded_lite_plan_readiness: same object-only payload contract.
     const planReadinessSchema = tool.schema.object(tools.bounded_lite_plan_readiness?.args as Record<string, any>);
-    expect(planReadinessSchema.safeParse({ payload: { frontmatter: { maturity_level: "M2" } } }).success).toBe(true);
-    expect(planReadinessSchema.safeParse({ payload: "markdown", dispatch: {} }).success).toBe(true);
+    expect(planReadinessSchema.safeParse({ payload: { frontmatter: { maturity_level: "M2" }, plan: { subtasks: [] } } }).success).toBe(true);
+    expect(planReadinessSchema.safeParse({ payload: "markdown", dispatch: {} }).success).toBe(false);
+    expect(planReadinessSchema.safeParse({ payload: JSON.stringify({ plan: { subtasks: [] } }) }).success).toBe(false);
 
-    // 4. bounded_lite_plan_artifact: required title, optional markdown/content and aliases
+    // 4. bounded_lite_plan_artifact: required title, optional markdown/content and aliases.
+    //    The v1 raw-shape helper cannot express title-plus-one-of(markdown, content)
+    //    at the root, so title-only stays schema-valid here; the cross-field rule is
+    //    documented on the arg descriptions and enforced before any write by
+    //    assertPlanArtifactWriteArgs (see handler execution tests below).
     const planArtifactSchema = tool.schema.object(tools.bounded_lite_plan_artifact?.args as Record<string, any>);
     expect(planArtifactSchema.safeParse({ title: "Test Plan" }).success).toBe(true);
     expect(
@@ -162,6 +179,9 @@ describe("plugin safety", () => {
       }).success,
     ).toBe(true);
     expect(planArtifactSchema.safeParse({ markdown: "# Missing Title" }).success).toBe(false);
+    expect(planArtifactSchema.safeParse({ title: "Test Plan", action: "delete", markdown: "# x" }).success).toBe(false);
+    expect(planArtifactSchema.safeParse({ title: "Test Plan", markdown: "# x", artifactKind: "memo" }).success).toBe(false);
+    expect(planArtifactSchema.safeParse({ title: "Test Plan", markdown: "# x", status: "published" }).success).toBe(false);
 
     // 5. bounded_lite_background: empty args
     const backgroundSchema = tool.schema.object(tools.bounded_lite_background?.args as Record<string, any>);
@@ -722,6 +742,254 @@ describe("plugin safety", () => {
     } finally {
       await rm(baseDir, { recursive: true, force: true });
       await rm(externalDir, { recursive: true, force: true });
+    }
+  });
+});
+
+function serializePlanToolArgs(args: Record<string, unknown>, flavor: "v1" | "v2"): Record<string, any> {
+  // v1 hosts project Zod raw shapes to draft-2020-12 (C01 evidence); the v2
+  // projection uses the same pinned Zod 4.1.8 API with its default target.
+  const serialized = flavor === "v1"
+    ? z.toJSONSchema(z.object(args as z.ZodRawShape), { target: "draft-2020-12" })
+    : z.toJSONSchema(z.object(args as z.ZodRawShape));
+  return JSON.parse(JSON.stringify(serialized));
+}
+
+describe("plan tool schema projection", () => {
+  it("serializes both plan tools' registered args to v1 and v2 JSON Schemas exposing typed payload.plan.subtasks", async () => {
+    const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+    const tools = hooks.tool ?? {};
+
+    for (const toolName of ["bounded_lite_plan_dag", "bounded_lite_plan_readiness"] as const) {
+      // Descriptions are provider-visible metadata on the registered schemas
+      // (zod keeps them in a per-copy registry, so read them from the args
+      // themselves rather than from a cross-copy projection).
+      const payloadArg = tools[toolName]!.args.payload as { description?: string };
+      expect(payloadArg.description).toContain("plan.subtasks");
+      expect(payloadArg.description).toContain("Example:");
+
+      for (const flavor of ["v1", "v2"] as const) {
+        const schema = serializePlanToolArgs(tools[toolName]!.args, flavor);
+
+        expect(schema.type).toBe("object");
+        expect(schema.required).toContain("payload");
+        expect(schema.properties.dispatch).toBeDefined();
+
+        const payloadSchema = schema.properties.payload;
+        expect(payloadSchema.type).toBe("object");
+        expect(payloadSchema.required).toContain("plan");
+        expect(payloadSchema.additionalProperties).toEqual({});
+
+        const subtasksSchema = payloadSchema.properties.plan.properties.subtasks;
+        expect(subtasksSchema.type).toBe("array");
+        const subtaskFields = Object.keys(subtasksSchema.items.properties);
+        expect(subtaskFields).toEqual(expect.arrayContaining([
+          "id",
+          "depends_on",
+          "attributes",
+          "deliverable",
+          "description",
+        ]));
+        expect(subtasksSchema.items.required).toEqual(expect.arrayContaining([
+          "id",
+          "depends_on",
+          "attributes",
+          "deliverable",
+          "description",
+        ]));
+      }
+    }
+  });
+
+  it("keeps the two intentional no-input tools empty in serialized schemas", async () => {
+    const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+    const tools = hooks.tool ?? {};
+
+    for (const toolName of ["bounded_lite_background", "bounded_lite_runtime_profile"] as const) {
+      for (const flavor of ["v1", "v2"] as const) {
+        const schema = serializePlanToolArgs(tools[toolName]!.args, flavor);
+        expect(schema.properties).toEqual({});
+        expect(schema.required ?? []).toEqual([]);
+      }
+    }
+  });
+});
+
+describe("plan tool handler execution", () => {
+  it("executes bounded_lite_plan_dag with the structured fixture and optional dispatch", async () => {
+    const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+    const payload = await loadStructuredPlanFixture();
+
+    const output = await hooks.tool?.bounded_lite_plan_dag?.execute(
+      { payload, dispatch: { concurrency: 5, attributeProfileMap: { security: "sec-profile" } } },
+      { directory: process.cwd() },
+    );
+    const dag = JSON.parse(String(output));
+
+    expect(dag.concurrency).toBe(5);
+    expect(dag.waves).toEqual([["C01"], ["C02"], ["C03"]]);
+    expect(dag.nodes.find((node: { id: string }) => node.id === "C02")?.dispatch).toMatchObject({
+      profile: "sec-profile",
+      matchedAttribute: "security",
+    });
+  });
+
+  it("fails bounded_lite_plan_dag once with an actionable diagnostic for malformed payloads", async () => {
+    const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+    const dagTool = hooks.tool!.bounded_lite_plan_dag!.execute;
+
+    await expect(dagTool({}, { directory: process.cwd() }))
+      .rejects.toThrow(/Missing `payload`.*Expected the named `payload` object/s);
+    await expect(dagTool({ payload: null }, { directory: process.cwd() }))
+      .rejects.toThrow(/is null/);
+    await expect(dagTool({ payload: ["a"] }, { directory: process.cwd() }))
+      .rejects.toThrow(/not an array/);
+    await expect(dagTool({ payload: "# raw markdown" }, { directory: process.cwd() }))
+      .rejects.toThrow(/raw Markdown document/);
+    await expect(dagTool(
+      { payload: JSON.stringify(await loadStructuredPlanFixture()) },
+      { directory: process.cwd() },
+    )).rejects.toThrow(/JSON-encoded string/);
+  });
+
+  it("executes bounded_lite_plan_readiness with the structured fixture and optional dispatch", async () => {
+    const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+    const payload = await loadStructuredPlanFixture();
+
+    const output = await hooks.tool?.bounded_lite_plan_readiness?.execute(
+      { payload, dispatch: { concurrency: 4 } },
+      { directory: process.cwd() },
+    );
+    const result = JSON.parse(String(output));
+
+    expect(result.executable).toBe(true);
+    expect(result.decision).toBe("execute");
+    expect(result.dag?.waves).toEqual([["C01"], ["C02"], ["C03"]]);
+  });
+
+  it("returns one format diagnostic (not a missing-section cascade) for bad readiness payload formats", async () => {
+    const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+    const readinessTool = hooks.tool!.bounded_lite_plan_readiness!.execute;
+    const markdown = [
+      "---",
+      "plan_schema_version: 2.1",
+      "maturity_level: M3",
+      "status: reviewed",
+      "---",
+      "",
+      "# Plan",
+      "",
+      "## Goals",
+    ].join("\n");
+
+    for (const badInput of [
+      undefined,
+      null,
+      ["a"],
+      markdown,
+      JSON.stringify(await loadStructuredPlanFixture()),
+    ]) {
+      const output = await readinessTool({ payload: badInput }, { directory: process.cwd() });
+      const result = JSON.parse(String(output));
+
+      expect(result.executable).toBe(false);
+      expect(result.decision).toBe("revise");
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]).toContain("Expected the named `payload` object");
+      expect(result.errors[0]).not.toContain("must be present and non-empty");
+    }
+  });
+
+  it("preserves adversarial blockers and extension metadata through the readiness handler", async () => {
+    const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+    const payload = await loadStructuredPlanFixture();
+
+    payload["maturity_level"] = "M2";
+    payload["status"] = "draft";
+    payload["open_questions"] = [{ question: "[Open Question] Ship now?", blocks_current_phase: true }];
+    payload["plan_review"] = {
+      decision: "revise",
+      findings: [{ location: "plan", issue: "gap", severity: "major", resolved: false }],
+    };
+    payload["self_check"] = { passed: false, blocked: true };
+    (payload["plan"] as { subtasks: unknown[] }).subtasks = [
+      { id: "a", depends_on: ["ghost"], attributes: [], deliverable: "a", description: "a", extra: "kept" },
+      { id: "a", depends_on: ["b"], attributes: [], deliverable: "dup", description: "dup" },
+      { id: "b", depends_on: ["a"], attributes: [], deliverable: "b", description: "b" },
+    ];
+
+    const output = await hooks.tool?.bounded_lite_plan_readiness?.execute(
+      { payload },
+      { directory: process.cwd() },
+    );
+    const result = JSON.parse(String(output));
+
+    expect(result.executable).toBe(false);
+    expect(result.decision).toBe("revise");
+
+    const errors = (result.errors as string[]).join("\n");
+    expect(errors).toContain("unresolved major Plan Review finding");
+    expect(errors).toContain("open_questions that block the current phase");
+    expect(errors).toContain("self-check reports a blocker");
+    expect(errors).toContain("depends on unknown subtask ghost");
+    expect(errors).toContain("duplicates a");
+    expect(errors).toContain("cycle");
+
+    // Passthrough intact: the handler forwarded the same object unchanged.
+    expect(payload["plan_review"]).toMatchObject({ decision: "revise" });
+    expect(payload["self_check"]).toMatchObject({ blocked: true });
+  });
+
+  it("fails title-only artifact writes before any I/O side effect", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "omo-lite-plan-args-"));
+
+    try {
+      const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+
+      await expect(hooks.tool?.bounded_lite_plan_artifact?.execute(
+        { title: "Title Only" },
+        { directory: root },
+      )).rejects.toThrow(/markdown.*content.*before any file write/s);
+      expect(await readdir(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("writes through the content alias and rejects artifact enum errors without writing", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "omo-lite-plan-args-"));
+
+    try {
+      const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+
+      const output = await hooks.tool?.bounded_lite_plan_artifact?.execute(
+        {
+          title: "Alias Write",
+          content: "# Plan via content alias",
+          artifactKind: "detailed-plan",
+          status: "reviewed",
+        },
+        { directory: root },
+      );
+      expect(String(output)).toContain("plan artifact persisted");
+
+      const plansDir = path.join(root, ".liteagent", "plans");
+      const files = await readdir(plansDir);
+      expect(files).toHaveLength(1);
+      expect(await readFile(path.join(plansDir, files[0]!), "utf8")).toContain("# Plan via content alias");
+
+      const before = await readdir(plansDir);
+      for (const badArgs of [
+        { title: "Bad Kind", content: "# x", artifactKind: "memo" },
+        { title: "Bad Status", content: "# x", status: "published" },
+        { title: "Bad Action", content: "# x", action: "delete" },
+      ]) {
+        await expect(hooks.tool?.bounded_lite_plan_artifact?.execute(badArgs, { directory: root }))
+          .rejects.toThrow(/must be/);
+      }
+      expect(await readdir(plansDir)).toEqual(before);
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 });

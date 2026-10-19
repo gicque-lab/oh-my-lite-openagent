@@ -7,6 +7,13 @@ import type {
   RoleName,
 } from "../contracts.js";
 
+/**
+ * Authoritative entrypoint for the executable plan payload contract (Zod wire
+ * schemas, PlanSubtask/ExecutablePlanPayload types, input-format diagnostics).
+ * Artifact-record/state-ownership exports below are unchanged.
+ */
+export * from "./plan-payload.js";
+
 export const ARTIFACT_KINDS = [
   "plan-skeleton",
   "detailed-plan",
