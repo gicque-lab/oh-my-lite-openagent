@@ -1,4 +1,5 @@
 import { createBoundedLitePlugin } from "../../.opencode/plugins/bounded-lite.js";
+import { tool } from "@opencode-ai/plugin";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -49,6 +50,155 @@ describe("plugin safety", () => {
     expect(toolNames).toContain("bounded_lite_study_package");
     expect(toolNames.every((toolName) => toolName.startsWith("bounded_lite_"))).toBe(true);
     expect(toolNames.every((toolName) => /^[a-zA-Z0-9_-]+$/.test(toolName))).toBe(true);
+  });
+
+  it("exposes explicit args shapes matching the nine-tool argument matrix", async () => {
+    const hooks = await createBoundedLitePlugin({
+      directory: process.cwd(),
+    });
+
+    const expectedToolKeys: Record<string, string[]> = {
+      bounded_lite_route: ["category"],
+      bounded_lite_plan_dag: ["dispatch", "payload"],
+      bounded_lite_plan_readiness: ["dispatch", "payload"],
+      bounded_lite_plan_artifact: [
+        "action",
+        "artifactKind",
+        "content",
+        "generatedBy",
+        "generated_by",
+        "markdown",
+        "maturityLevel",
+        "maturity_level",
+        "overwrite",
+        "path",
+        "planId",
+        "plan_id",
+        "recommended_plan_path",
+        "status",
+        "title",
+      ],
+      bounded_lite_background: [],
+      bounded_lite_runtime_profile: [],
+      bounded_lite_study_ingest: ["allowExternalDirectory", "directory"],
+      bounded_lite_study_package: ["allowExternalDirectory", "directory", "stage"],
+      bounded_lite_model_config: [
+        "action",
+        "allowCodexBackend",
+        "allowUnavailableModels",
+        "assignments",
+        "familyPreference",
+        "policy",
+        "profileAssignments",
+        "profileReasoningEffortAssignments",
+        "providerPreference",
+        "reasoningAssignments",
+        "reasoningEffortAssignments",
+        "source",
+        "taskLeadProfileAssignments",
+        "taskLeadProfileReasoningEffortAssignments",
+      ],
+    };
+
+    const registeredTools = hooks.tool ?? {};
+    const registeredNames = Object.keys(registeredTools).sort();
+    const expectedNames = Object.keys(expectedToolKeys).sort();
+
+    expect(registeredNames).toEqual(expectedNames);
+
+    for (const [toolName, expectedKeys] of Object.entries(expectedToolKeys)) {
+      const definition = registeredTools[toolName];
+      expect(definition).toBeDefined();
+      expect(definition?.args).toBeDefined();
+      expect(typeof definition?.args).toBe("object");
+
+      const actualKeys = Object.keys(definition?.args ?? {}).sort();
+      expect(actualKeys).toEqual([...expectedKeys].sort());
+    }
+  });
+
+  it("validates representative input payloads against tool argument schemas", async () => {
+    const hooks = await createBoundedLitePlugin({
+      directory: process.cwd(),
+    });
+
+    const tools = hooks.tool ?? {};
+
+    // 1. bounded_lite_route: requires string category
+    const routeSchema = tool.schema.object(tools.bounded_lite_route?.args as Record<string, any>);
+    expect(routeSchema.safeParse({ category: "execution" }).success).toBe(true);
+    expect(routeSchema.safeParse({}).success).toBe(false);
+    expect(routeSchema.safeParse({ category: 123 }).success).toBe(false);
+
+    // 2. bounded_lite_plan_dag: opaque payload, optional dispatch
+    const planDagSchema = tool.schema.object(tools.bounded_lite_plan_dag?.args as Record<string, any>);
+    expect(planDagSchema.safeParse({ payload: { plan: { subtasks: [] } } }).success).toBe(true);
+    expect(planDagSchema.safeParse({ payload: "raw-string-plan", dispatch: { concurrency: 4 } }).success).toBe(true);
+    expect(planDagSchema.safeParse({ payload: "plan-string" }).success).toBe(true);
+
+    // 3. bounded_lite_plan_readiness: opaque payload, optional dispatch
+    const planReadinessSchema = tool.schema.object(tools.bounded_lite_plan_readiness?.args as Record<string, any>);
+    expect(planReadinessSchema.safeParse({ payload: { frontmatter: { maturity_level: "M2" } } }).success).toBe(true);
+    expect(planReadinessSchema.safeParse({ payload: "markdown", dispatch: {} }).success).toBe(true);
+
+    // 4. bounded_lite_plan_artifact: required title, optional markdown/content and aliases
+    const planArtifactSchema = tool.schema.object(tools.bounded_lite_plan_artifact?.args as Record<string, any>);
+    expect(planArtifactSchema.safeParse({ title: "Test Plan" }).success).toBe(true);
+    expect(
+      planArtifactSchema.safeParse({
+        title: "Test Plan",
+        markdown: "# Content",
+        action: "write",
+        overwrite: true,
+        plan_id: "plan-1",
+      }).success,
+    ).toBe(true);
+    expect(
+      planArtifactSchema.safeParse({
+        title: "Test Plan",
+        content: "# Content Alias",
+        status: "reviewed",
+      }).success,
+    ).toBe(true);
+    expect(planArtifactSchema.safeParse({ markdown: "# Missing Title" }).success).toBe(false);
+
+    // 5. bounded_lite_background: empty args
+    const backgroundSchema = tool.schema.object(tools.bounded_lite_background?.args as Record<string, any>);
+    expect(backgroundSchema.safeParse({}).success).toBe(true);
+
+    // 6. bounded_lite_runtime_profile: empty args
+    const runtimeProfileSchema = tool.schema.object(tools.bounded_lite_runtime_profile?.args as Record<string, any>);
+    expect(runtimeProfileSchema.safeParse({}).success).toBe(true);
+
+    // 7. bounded_lite_study_ingest: optional directory and boolean allowExternalDirectory
+    const studyIngestSchema = tool.schema.object(tools.bounded_lite_study_ingest?.args as Record<string, any>);
+    expect(studyIngestSchema.safeParse({}).success).toBe(true);
+    expect(studyIngestSchema.safeParse({ directory: "courseware", allowExternalDirectory: true }).success).toBe(true);
+    expect(studyIngestSchema.safeParse({ allowExternalDirectory: "invalid-boolean" }).success).toBe(false);
+
+    // 8. bounded_lite_study_package: optional stage, directory, allowExternalDirectory
+    const studyPackageSchema = tool.schema.object(tools.bounded_lite_study_package?.args as Record<string, any>);
+    expect(studyPackageSchema.safeParse({}).success).toBe(true);
+    expect(studyPackageSchema.safeParse({ stage: "sources", directory: "docs", allowExternalDirectory: false }).success).toBe(true);
+
+    // 9. bounded_lite_model_config: optional actions, policy, assignment records
+    const modelConfigSchema = tool.schema.object(tools.bounded_lite_model_config?.args as Record<string, any>);
+    expect(modelConfigSchema.safeParse({ action: "auto" }).success).toBe(true);
+    expect(
+      modelConfigSchema.safeParse({
+        action: "apply",
+        assignments: { "command-lead": "openai/gpt-5.4" },
+        reasoningEffortAssignments: { "command-lead": "high" },
+        taskLeadProfileAssignments: { code: "openai/gpt-5.4" },
+        allowUnavailableModels: true,
+      }).success,
+    ).toBe(true);
+    expect(
+      modelConfigSchema.safeParse({
+        policy: { source: "all", allowCodexBackend: false },
+        familyPreference: ["gpt", "claude"],
+      }).success,
+    ).toBe(true);
   });
 
   it("returns promises from bounded lite tools and hooks", async () => {

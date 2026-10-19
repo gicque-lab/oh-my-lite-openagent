@@ -1,4 +1,5 @@
 import { MAX_CHILD_ORCHESTRATOR_DEPTH, ROLE_CONTRACTS, type RoutingCategory } from "../lib/contracts.js";
+import { tool } from "@opencode-ai/plugin";
 import { BackgroundCoordinator } from "../lib/runtime/background.js";
 import {
   type PluginHooks,
@@ -1185,6 +1186,9 @@ export async function createBoundedLitePlugin(
     tool: {
       bounded_lite_route: {
         description: "Resolve a bounded internal routing category to its target role.",
+        args: {
+          category: tool.schema.string(),
+        },
         async execute(args) {
           const category = args["category"];
 
@@ -1197,6 +1201,10 @@ export async function createBoundedLitePlugin(
       },
       bounded_lite_plan_dag: {
         description: "Validate a required plan.subtasks payload and return bounded DAG waves plus dispatch profiles.",
+        args: {
+          payload: tool.schema.unknown(),
+          dispatch: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
+        },
         async execute(args) {
           const payload = args["payload"];
           const dispatch = mergeTaskDispatchWithConfiguredProfiles(
@@ -1209,6 +1217,10 @@ export async function createBoundedLitePlugin(
       },
       bounded_lite_plan_readiness: {
         description: "Validate a Plan Builder artifact against readiness gates before Command Lead dispatches execution.",
+        args: {
+          payload: tool.schema.unknown(),
+          dispatch: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
+        },
         async execute(args) {
           const payload = args["payload"];
           const dispatch = mergeTaskDispatchWithConfiguredProfiles(
@@ -1221,6 +1233,23 @@ export async function createBoundedLitePlugin(
       },
       bounded_lite_plan_artifact: {
         description: "Persist a Command Lead-approved plan artifact under .liteagent/plans and append .liteagent/plan-index.jsonl.",
+        args: {
+          title: tool.schema.string(),
+          markdown: tool.schema.string().optional(),
+          content: tool.schema.string().optional(),
+          action: tool.schema.string().optional(),
+          planId: tool.schema.string().optional(),
+          plan_id: tool.schema.string().optional(),
+          maturityLevel: tool.schema.string().optional(),
+          maturity_level: tool.schema.string().optional(),
+          generatedBy: tool.schema.string().optional(),
+          generated_by: tool.schema.string().optional(),
+          path: tool.schema.string().optional(),
+          recommended_plan_path: tool.schema.string().optional(),
+          artifactKind: tool.schema.string().optional(),
+          status: tool.schema.string().optional(),
+          overwrite: tool.schema.boolean().optional(),
+        },
         async execute(args, context) {
           const action = readString(args["action"]) ?? "write";
           if (action !== "write") {
@@ -1263,24 +1292,35 @@ export async function createBoundedLitePlugin(
       },
       bounded_lite_background: {
         description: "List currently tracked background tasks from the bounded coordinator.",
+        args: {},
         async execute() {
           return formatToolJsonOutput(background.list());
         },
       },
       bounded_lite_runtime_profile: {
         description: "Report the current runtime profile without creating a second control plane.",
+        args: {},
         async execute() {
           return formatToolJsonOutput(runtimeProfile);
         },
       },
       bounded_lite_study_ingest: {
         description: "Discover first-level .ppt, .pptx, and .pdf courseware in the current directory and return a structured study source index with low-text and recoverable-blocker reports. Passing a directory outside the current OpenCode working directory requires allowExternalDirectory=true after explicit user authorization.",
+        args: {
+          directory: tool.schema.string().optional(),
+          allowExternalDirectory: tool.schema.boolean().optional(),
+        },
         async execute(args, context) {
           return formatToolJsonOutput(await ingestStudyCourseware(resolveStudyDirectory(args, context)));
         },
       },
       bounded_lite_study_package: {
         description: "Generate the current-directory /study review project files from first-level courseware while preserving AGENTS.md managed-block safety. Use stage=sources for a source-index/notes-only pass before full review generation. Passing a directory outside the current OpenCode working directory requires allowExternalDirectory=true after explicit user authorization.",
+        args: {
+          stage: tool.schema.string().optional(),
+          directory: tool.schema.string().optional(),
+          allowExternalDirectory: tool.schema.boolean().optional(),
+        },
         async execute(args, context) {
           return formatToolJsonOutput(await generateStudyPackage(resolveStudyDirectory(args, context), readStudyPackageStage(args)));
         },
@@ -1289,13 +1329,13 @@ export async function createBoundedLitePlugin(
         description: `Import, list, recommend, or update per-role and Task Lead profile OpenCode models for Oh My Lite OpenAgent.
 
 Actions:
-	- import: Import all available OpenCode model providers by default. Call with { "action": "import" }.
+\t- import: Import all available OpenCode model providers by default. Call with { "action": "import" }.
 - list: Show current role model assignments and available provider models. Call with { "action": "list" }.
 - auto: Show the imported model pool first, then recommend role and Task Lead profile model assignments from that pool based on capability needs. This does not write config. Call with { "action": "auto" }.
 - apply: Manually assign specific models, reasoning effort, or profile models. Call with { "action": "apply", "assignments": { "role-name": "provider/model-id" }, "reasoningEffortAssignments": { "command-lead": "high" }, "taskLeadProfileAssignments": { "code": "provider/model-id" } }.
 
 Policy:
-	- source and providerPreference are optional narrowing filters; by default the imported pool includes every discovered provider.
+\t- source and providerPreference are optional narrowing filters; by default the imported pool includes every discovered provider.
 - allowCodexBackend defaults to false.
 - familyPreference can limit the imported pool, for example { "familyPreference": ["gpt"] } for GPT-family subscription models.
 - reasoningEffortAssignments supports minimal, low, medium, or high and writes agent.<role>.reasoningEffort for providers/models that support that option.
@@ -1325,6 +1365,22 @@ AI selection rule:
 - After action=auto, ask the user whether they want to modify the recommendations before calling action=apply.
 
 If no provider models are found, tell the user to configure or connect OpenCode providers first.`,
+        args: {
+          action: tool.schema.string().optional(),
+          source: tool.schema.string().optional(),
+          providerPreference: tool.schema.array(tool.schema.string()).optional(),
+          familyPreference: tool.schema.array(tool.schema.string()).optional(),
+          allowCodexBackend: tool.schema.boolean().optional(),
+          policy: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
+          assignments: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
+          reasoningEffortAssignments: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
+          reasoningAssignments: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
+          taskLeadProfileAssignments: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
+          profileAssignments: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
+          taskLeadProfileReasoningEffortAssignments: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
+          profileReasoningEffortAssignments: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
+          allowUnavailableModels: tool.schema.boolean().optional(),
+        },
         async execute(args, context) {
           const action = typeof args["action"] === "string" ? args["action"] : "list";
           const config = await readOpenCodeConfig(options.configDir);
