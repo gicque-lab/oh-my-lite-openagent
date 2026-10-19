@@ -95,6 +95,60 @@ describe("global installer JSONC config handling", () => {
     }
   });
 
+  it("generates configured specialist agents with scoped permissions and Command Lead delegation", async () => {
+    const configDir = await mkdtemp(path.join(os.tmpdir(), "omo-lite-specialists-"));
+
+    try {
+      const jsonPath = path.join(configDir, "opencode.json");
+      const litePath = path.join(configDir, "oh-my-lite-openagent.json");
+      await writeFile(jsonPath, `${JSON.stringify({
+        agent: {
+          "security-audit": { model: "openai/old-model" },
+          "custom-agent": { model: "openai/custom" },
+        },
+      })}\n`);
+      await writeFile(litePath, `${JSON.stringify({
+        schemaVersion: 1,
+        roleModels: {},
+        roleReasoningEffort: {},
+        taskLeadProfiles: {},
+        specialists: {
+          "security-audit": {
+            name: "security-audit",
+            description: "Audit security-sensitive source files.",
+            model: "anthropic/claude-sonnet-4-6",
+            reasoningEffort: "high",
+            editFolders: ["src/security", "security-reports/**"],
+            prompt: "Perform a bounded security audit.",
+          },
+        },
+      })}\n`);
+
+      await runInstaller(configDir);
+      const writtenConfig = JSON.parse(await readFile(jsonPath, "utf8"));
+      const specialist = await readFile(path.join(configDir, "agents", "security-audit.md"), "utf8");
+      const commandLead = await readFile(path.join(configDir, "agents", "command-lead.md"), "utf8");
+
+      expect(writtenConfig.agent["security-audit"]).toBeUndefined();
+      expect(writtenConfig.agent["custom-agent"]).toEqual({ model: "openai/custom" });
+      expect(specialist).toContain("mode: subagent");
+      expect(specialist).toContain("hidden: true");
+      expect(specialist).toContain('model: "anthropic/claude-sonnet-4-6"');
+      expect(specialist).toContain("reasoningEffort: high");
+      expect(specialist).toContain("question: deny");
+      expect(specialist).toContain('"src/security/**": allow');
+      expect(specialist).toContain('"**/src/security/**": allow');
+      expect(specialist).toContain('"security-reports/**": allow');
+      expect(specialist).toContain("bash:");
+      expect(specialist).toContain('"*": deny');
+      expect(specialist).toContain("Perform a bounded security audit.");
+      expect(commandLead).toContain("security-audit: allow");
+      expect(commandLead).toContain("task:");
+    } finally {
+      await rm(configDir, { recursive: true, force: true });
+    }
+  });
+
   it("creates backups only for files that already exist", async () => {
     const configDir = await mkdtemp(path.join(os.tmpdir(), "omo-lite-backup-existing-"));
 
@@ -165,7 +219,7 @@ describe("global installer JSONC config handling", () => {
       await runInstaller(configDir);
       const generatedCommandLead = await readFile(agentPath, "utf8");
 
-      expect(generatedCommandLead).not.toContain("reasoningEffort:");
+      expect(generatedCommandLead).toContain("reasoningEffort: high");
     } finally {
       await rm(configDir, { recursive: true, force: true });
     }

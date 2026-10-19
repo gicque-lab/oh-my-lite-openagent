@@ -12,10 +12,15 @@ import { validatePlanReadiness } from "../lib/runtime/plan-readiness.js";
 import { writePlanArtifact } from "../lib/runtime/plan-artifact.js";
 import { createRuntimeProfile } from "../lib/runtime/safety.js";
 import {
+  buildSpecialistFrontmatter,
+  type SpecialistAgentConfig,
+} from "../lib/runtime/specialist-registry.js";
+import {
   formatAutoModelReport,
   formatModelImportReport,
   formatModelConfigReport,
   formatTaskLeadProfileModelReport,
+  applySpecialistAssignments,
   importModelPool,
   inferModelPoolPolicy,
   listKnownModelsForCredentialProviders,
@@ -30,6 +35,7 @@ import {
   resolveAutoReasoningEffortAssignments,
   resolveAutoTaskLeadProfileModels,
   summarizeRoleModels,
+  summarizeSpecialists,
   summarizeTaskLeadProfileModels,
 } from "../lib/runtime/model-config.js";
 import {
@@ -886,6 +892,7 @@ function taskLeadProfilesToDispatch(
 ): Partial<TaskDispatchConfig> {
   const profileModelMap: Record<string, string> = {};
   const profileFallbackModelMap: Record<string, string[]> = {};
+  const profileReasoningEffortMap: Record<string, "minimal" | "low" | "medium" | "high" | "xhigh" | "max"> = {};
   const attributeProfileMap: Record<string, string> = {};
 
   for (const [profileName, rawProfile] of Object.entries(taskLeadProfiles)) {
@@ -894,9 +901,13 @@ function taskLeadProfilesToDispatch(
     const model = readString(rawProfile["model"]);
     const fallbackModels = readStringArray(rawProfile["fallbackModels"]);
     const attributes = readStringArray(rawProfile["attributes"]);
+    const reasoningEffort = readString(rawProfile["reasoningEffort"]);
 
     if (model) profileModelMap[profileName] = model;
     if (fallbackModels.length > 0) profileFallbackModelMap[profileName] = fallbackModels;
+    if (reasoningEffort && ["minimal", "low", "medium", "high", "xhigh", "max"].includes(reasoningEffort)) {
+      profileReasoningEffortMap[profileName] = reasoningEffort as typeof profileReasoningEffortMap[string];
+    }
 
     for (const attribute of attributes) {
       attributeProfileMap[attribute] = profileName;
@@ -906,6 +917,7 @@ function taskLeadProfilesToDispatch(
   return {
     ...(Object.keys(profileModelMap).length > 0 ? { profileModelMap } : {}),
     ...(Object.keys(profileFallbackModelMap).length > 0 ? { profileFallbackModelMap } : {}),
+    ...(Object.keys(profileReasoningEffortMap).length > 0 ? { profileReasoningEffortMap } : {}),
     ...(Object.keys(attributeProfileMap).length > 0 ? { attributeProfileMap } : {}),
   };
 }
@@ -913,8 +925,12 @@ function taskLeadProfilesToDispatch(
 function mergeTaskDispatchWithConfiguredProfiles(
   dispatch: Record<string, unknown>,
   options: NormalizedBoundedLitePluginOptions,
+  configuredTaskLeadProfiles: Record<string, unknown> = {},
 ): Partial<TaskDispatchConfig> {
-  const profileDispatch = taskLeadProfilesToDispatch(options.taskLeadProfiles ?? {});
+  const profileDispatch = taskLeadProfilesToDispatch({
+    ...(options.taskLeadProfiles ?? {}),
+    ...configuredTaskLeadProfiles,
+  });
   const inputDispatch = dispatch as Partial<TaskDispatchConfig>;
 
   return {
@@ -928,6 +944,10 @@ function mergeTaskDispatchWithConfiguredProfiles(
       ...(profileDispatch.profileFallbackModelMap ?? {}),
       ...(isRecord(inputDispatch.profileFallbackModelMap) ? inputDispatch.profileFallbackModelMap : {}),
     },
+    profileReasoningEffortMap: {
+      ...(profileDispatch.profileReasoningEffortMap ?? {}),
+      ...(isRecord(inputDispatch.profileReasoningEffortMap) ? inputDispatch.profileReasoningEffortMap : {}),
+    },
     attributeProfileMap: {
       ...(profileDispatch.attributeProfileMap ?? {}),
       ...(isRecord(inputDispatch.attributeProfileMap) ? inputDispatch.attributeProfileMap : {}),
@@ -939,6 +959,21 @@ async function readOpenCodeConfig(configDir?: string): Promise<Record<string, un
   const configPath = await resolveOpenCodeConfigPath(configDir);
   const content = await readFile(configPath, "utf8");
   return parseJsonConfig(content);
+}
+async function readRuntimeLiteConfig(configDir?: string): Promise<{
+  config: Record<string, unknown>;
+  liteConfig: LiteOpenAgentConfig;
+}> {
+  let config: Record<string, unknown> = {};
+  try {
+    config = await readOpenCodeConfig(configDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+  }
+  return {
+    config,
+    liteConfig: await readLiteConfigFile(configDir, config),
+  };
 }
 
 async function readOpenCodeAuthProviderIds(): Promise<string[]> {
@@ -989,11 +1024,13 @@ async function writeLiteConfigFile(liteConfig: LiteOpenAgentConfig, configDir?: 
 async function updateGeneratedAgentMarkdownFiles(
   liteConfig: LiteOpenAgentConfig,
   configDir?: string,
+  projectRoot: string = process.cwd(),
 ): Promise<string[]> {
   const directory = defaultConfigDir(configDir);
   const agentsDir = path.join(directory, "agents");
   await mkdir(agentsDir, { recursive: true });
   const updated: string[] = [];
+  const specialistNames = Object.keys(liteConfig.specialists ?? {});
 
   for (const role of ROLE_CONTRACTS) {
     const filePath = path.join(agentsDir, `${role.name}.md`);
@@ -1004,16 +1041,115 @@ async function updateGeneratedAgentMarkdownFiles(
       if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
     }
     const model = liteConfig.roleModels[role.name];
+    const reasoningEffort = liteConfig.roleReasoningEffort[role.name];
     const nextContent = upsertMarkdownFrontmatter(content, {
       ...(model ? { model } : {}),
-      reasoningEffort: undefined,
+      ...(reasoningEffort ? { reasoningEffort } : { reasoningEffort: undefined }),
     });
+    const synchronizedContent = role.name === "command-lead" && specialistNames.length > 0
+      ? upsertMarkdownTaskPermissions(nextContent, buildCommandLeadTaskPermissions(nextContent, specialistNames))
+      : nextContent;
     await writeFile(`${filePath}.bak`, content);
-    await writeFile(filePath, nextContent);
+    await writeFile(filePath, synchronizedContent);
+    updated.push(filePath);
+  }
+  for (const [specialistName, rawSpecialist] of Object.entries(liteConfig.specialists ?? {})) {
+    const specialist = rawSpecialist as SpecialistAgentConfig;
+    const filePath = path.join(agentsDir, `${specialistName}.md`);
+    let content = `---\n${yamlLines(buildSpecialistFrontmatter(specialist)).join("\n")}\n---\n\n# ${specialistName}\n\n${specialist.description}\n`;
+    try {
+      const existing = await readFile(filePath, "utf8");
+      const match = existing.match(/^---\n[\s\S]*?\n---\n?/);
+      const body = match ? existing.slice(match[0].length).replace(/^\n+/, "") : existing;
+      content = `---\n${yamlLines(buildSpecialistFrontmatter(specialist)).join("\n")}\n---\n\n${body}`;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+    }
+
+    if (specialist.prompt && content.endsWith(`# ${specialistName}\n\n${specialist.description}\n`)) {
+      content = `---\n${yamlLines(buildSpecialistFrontmatter(specialist)).join("\n")}\n---\n\n${specialist.prompt.trimEnd()}\n`;
+    } else if (specialist.promptFile && content.endsWith(`# ${specialistName}\n\n${specialist.description}\n`)) {
+      const prompt = await readFile(path.resolve(projectRoot, specialist.promptFile), "utf8");
+      content = `---\n${yamlLines(buildSpecialistFrontmatter(specialist)).join("\n")}\n---\n\n${prompt.trimEnd()}\n`;
+    }
+
+    let previous = "";
+    try {
+      previous = await readFile(filePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+    }
+    await writeFile(`${filePath}.bak`, previous);
+    await writeFile(filePath, content);
     updated.push(filePath);
   }
 
   return updated;
+}
+
+function yamlLines(value: unknown, indent = 0): string[] {
+  const prefix = " ".repeat(indent);
+  if (!isRecord(value)) return [`${prefix}${yamlScalar(String(value))}`];
+  const lines: string[] = [];
+
+  for (const [key, child] of Object.entries(value)) {
+    const yamlKey = /^[a-zA-Z0-9_-]+$/.test(key) ? key : JSON.stringify(key);
+    if (isRecord(child)) {
+      lines.push(`${prefix}${yamlKey}:`);
+      lines.push(...yamlLines(child, indent + 2));
+    } else {
+      lines.push(`${prefix}${yamlKey}: ${yamlScalar(String(child))}`);
+    }
+  }
+
+  return lines;
+}
+
+function buildCommandLeadTaskPermissions(content: string, specialistNames: readonly string[]): Record<string, string> {
+  const match = content.match(/^---\n([\s\S]*?)\n---\n?/);
+  const frontmatter = match?.[1] ?? "";
+  const task: Record<string, string> = { "*": "deny" };
+  const taskStart = frontmatter.split("\n").findIndex((line) => line.trim() === "task:");
+  if (taskStart >= 0) {
+    for (const line of frontmatter.split("\n").slice(taskStart + 1)) {
+      if (!/^\s{4,}\S/.test(line)) break;
+      const item = line.trim().match(/^([^:]+):\s*(allow|deny|ask)$/);
+      if (item?.[1] && item[1] !== "\"*\"") task[item[1].replace(/^"|"$/g, "")] = item[2]!;
+    }
+  }
+  for (const specialistName of specialistNames) task[specialistName] = "allow";
+  return task;
+}
+
+function upsertMarkdownTaskPermissions(content: string, task: Record<string, string>): string {
+  const match = content.match(/^---\n([\s\S]*?)\n---\n?/);
+  const frontmatter = match?.[1] ?? "";
+  const body = match ? content.slice(match[0].length) : content;
+  const lines = frontmatter.split("\n");
+  const permissionStart = lines.findIndex((line) => line.trim() === "permission:");
+  const taskLines = ["  task:", ...Object.entries(task).map(([key, value]) => `    ${/^[a-zA-Z0-9_-]+$/.test(key) ? key : JSON.stringify(key)}: ${yamlScalar(value)}`)];
+
+  if (permissionStart < 0) {
+    lines.push("permission:", ...taskLines);
+  } else {
+    let taskStart = -1;
+    for (let index = permissionStart + 1; index < lines.length; index += 1) {
+      if (!/^\s{2,}\S/.test(lines[index] ?? "")) break;
+      if (lines[index]?.trim() === "task:") {
+        taskStart = index;
+        break;
+      }
+    }
+    if (taskStart < 0) {
+      lines.splice(permissionStart + 1, 0, ...taskLines);
+    } else {
+      let taskEnd = taskStart + 1;
+      while (taskEnd < lines.length && /^\s{4,}\S/.test(lines[taskEnd] ?? "")) taskEnd += 1;
+      lines.splice(taskStart, taskEnd - taskStart, ...taskLines);
+    }
+  }
+
+  return `---\n${lines.join("\n")}\n---\n\n${body.replace(/^\n+/, "")}`;
 }
 
 function upsertMarkdownFrontmatter(content: string, updates: Record<string, string | undefined>): string {
@@ -1207,9 +1343,11 @@ export async function createBoundedLitePlugin(
         },
         async execute(args) {
           const payload = args["payload"];
+          const runtime = await readRuntimeLiteConfig(options.configDir);
           const dispatch = mergeTaskDispatchWithConfiguredProfiles(
             isRecord(args["dispatch"]) ? args["dispatch"] : {},
             options,
+            runtime.liteConfig.taskLeadProfiles,
           );
 
           return formatToolJsonOutput(buildTaskDAG(payload, dispatch as Partial<TaskDispatchConfig>));
@@ -1223,9 +1361,11 @@ export async function createBoundedLitePlugin(
         },
         async execute(args) {
           const payload = args["payload"];
+          const runtime = await readRuntimeLiteConfig(options.configDir);
           const dispatch = mergeTaskDispatchWithConfiguredProfiles(
             isRecord(args["dispatch"]) ? args["dispatch"] : {},
             options,
+            runtime.liteConfig.taskLeadProfiles,
           );
 
           return formatToolJsonOutput(validatePlanReadiness(payload, dispatch as Partial<TaskDispatchConfig>));
@@ -1301,7 +1441,28 @@ export async function createBoundedLitePlugin(
         description: "Report the current runtime profile without creating a second control plane.",
         args: {},
         async execute() {
-          return formatToolJsonOutput(runtimeProfile);
+          const runtime = await readRuntimeLiteConfig(options.configDir);
+          const profileReasoningEffort = Object.fromEntries(
+            Object.entries(runtime.liteConfig.taskLeadProfiles)
+              .filter(([, profile]) => Boolean(profile.reasoningEffort))
+              .map(([name, profile]) => [name, profile.reasoningEffort]),
+          ) as Record<string, "minimal" | "low" | "medium" | "high" | "xhigh" | "max">;
+          const currentProfile = createRuntimeProfile({
+            pluginEnabled: options.mode === "full",
+            hooksEnabled: options.enableHooks,
+            backgroundEnabled: options.enableBackground,
+            bundledMcpEnabled: options.enableBundledMcp,
+            ...(Object.keys(runtime.liteConfig.roleReasoningEffort).length > 0
+              ? { roleReasoningEffort: runtime.liteConfig.roleReasoningEffort }
+              : {}),
+            ...(Object.keys(profileReasoningEffort).length > 0
+              ? { taskLeadProfileReasoningEffort: profileReasoningEffort }
+              : {}),
+            ...(Object.keys(runtime.liteConfig.specialists ?? {}).length > 0
+              ? { specialists: Object.keys(runtime.liteConfig.specialists ?? {}) }
+              : {}),
+          });
+          return formatToolJsonOutput(currentProfile);
         },
       },
       bounded_lite_study_ingest: {
@@ -1330,9 +1491,9 @@ export async function createBoundedLitePlugin(
 
 Actions:
 \t- import: Import all available OpenCode model providers by default. Call with { "action": "import" }.
-- list: Show current role model assignments and available provider models. Call with { "action": "list" }.
+- list: Show current role model assignments, Task Lead profile settings, registered specialists, and available provider models. Call with { \"action\": \"list\" }.
 - auto: Show the imported model pool first, then recommend role and Task Lead profile model assignments from that pool based on capability needs. This does not write config. Call with { "action": "auto" }.
-- apply: Manually assign specific models, reasoning effort, or profile models. Call with { "action": "apply", "assignments": { "role-name": "provider/model-id" }, "reasoningEffortAssignments": { "command-lead": "high" }, "taskLeadProfileAssignments": { "code": "provider/model-id" } }.
+- apply: Manually assign specific models, reasoning effort, profile models, or registered specialist models/effort. Call with { \"action\": \"apply\", \"assignments\": { \"role-name\": \"provider/model-id\" }, \"reasoningEffortAssignments\": { \"command-lead\": \"high\" }, \"taskLeadProfileAssignments\": { \"code\": \"provider/model-id\" }, \"specialistAssignments\": { \"specialist-name\": { \"model\": \"provider/model-id\", \"reasoningEffort\": \"high\" } } }.
 
 Policy:
 \t- source and providerPreference are optional narrowing filters; by default the imported pool includes every discovered provider.
@@ -1377,6 +1538,7 @@ If no provider models are found, tell the user to configure or connect OpenCode 
           reasoningAssignments: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
           taskLeadProfileAssignments: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
           profileAssignments: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
+          specialistAssignments: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
           taskLeadProfileReasoningEffortAssignments: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
           profileReasoningEffortAssignments: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
           allowUnavailableModels: tool.schema.boolean().optional(),
@@ -1402,6 +1564,7 @@ If no provider models are found, tell the user to configure or connect OpenCode 
           const inferredPolicy = inferModelPoolPolicy(effectiveConfig, readModelPoolPolicy(args));
           const poolPolicy = inferredPolicy.policy;
           const importedPool = importModelPool(models, poolPolicy);
+          const specialistSummaries = summarizeSpecialists(liteConfig);
 
           if (action === "import") {
             return [
@@ -1438,6 +1601,13 @@ If no provider models are found, tell the user to configure or connect OpenCode 
                 "Available provider models:",
                 "- <none found>",
                 "",
+                "Registered specialists:",
+                ...(specialistSummaries.length > 0
+                  ? specialistSummaries.map((specialist) => (
+                    `- ${specialist.name}: ${specialist.configuredModel ?? "<unset>"}${specialist.configuredReasoningEffort ? ` reasoningEffort=${specialist.configuredReasoningEffort}` : ""}`
+                  ))
+                  : ["- <none>"]),
+                "",
                 "Debug info:",
                 ...debugLines,
                 "",
@@ -1456,6 +1626,7 @@ If no provider models are found, tell the user to configure or connect OpenCode 
             return formatModelConfigReport({
               roles: summarizeRoleModels(effectiveConfig),
               taskLeadProfiles: summarizeTaskLeadProfileModels(effectiveConfig),
+              specialists: specialistSummaries,
               models,
             });
           }
@@ -1516,6 +1687,7 @@ If no provider models are found, tell the user to configure or connect OpenCode 
               formatModelConfigReport({
                 roles: summarizeRoleModels(effectiveConfig),
                 taskLeadProfiles: summarizeTaskLeadProfileModels(effectiveConfig),
+                specialists: specialistSummaries,
                 models: importedPool,
               }),
               "",
@@ -1546,6 +1718,9 @@ If no provider models are found, tell the user to configure or connect OpenCode 
               {},
               args["taskLeadProfileReasoningEffortAssignments"] ?? args["profileReasoningEffortAssignments"],
             );
+            const specialistAssignments = isRecord(args["specialistAssignments"])
+              ? args["specialistAssignments"]
+              : {};
 
             const hasRoleAssignments = Object.keys(roleModelAssignments).length > 0;
             const hasReasoningAssignments = Object.keys(reasoningEffortAssignments).length > 0;
@@ -1553,10 +1728,11 @@ If no provider models are found, tell the user to configure or connect OpenCode 
               taskLeadProfileAssignments !== null &&
               !Array.isArray(taskLeadProfileAssignments);
             const hasProfileReasoningAssignments = Object.keys(profileReasoningEffortAssignments).length > 0;
+            const hasSpecialistAssignments = Object.keys(specialistAssignments).length > 0;
 
-            if (!hasRoleAssignments && !hasProfileAssignments && !hasReasoningAssignments && !hasProfileReasoningAssignments) {
+            if (!hasRoleAssignments && !hasProfileAssignments && !hasReasoningAssignments && !hasProfileReasoningAssignments && !hasSpecialistAssignments) {
               throw new Error(
-                "bounded_lite_model_config apply requires assignments, reasoningEffortAssignments, taskLeadProfileAssignments, or taskLeadProfileReasoningEffortAssignments.",
+                "bounded_lite_model_config apply requires assignments, reasoningEffortAssignments, taskLeadProfileAssignments, taskLeadProfileReasoningEffortAssignments, or specialistAssignments.",
               );
             }
 
@@ -1584,8 +1760,20 @@ If no provider models are found, tell the user to configure or connect OpenCode 
               liteConfig,
               profileReasoningEffortAssignments,
             ) : { changed: [], skipped: [] };
+            const specialistResult = hasSpecialistAssignments ? applySpecialistAssignments(
+              liteConfig,
+              specialistAssignments,
+              importedPool.map((model) => model.id),
+              {
+                allowUnavailableModels: args["allowUnavailableModels"] === true,
+              },
+            ) : { changed: [], skipped: [], warnings: [] };
             const liteConfigPath = await writeLiteConfigFile(liteConfig, options.configDir);
-            const updatedAgents = await updateGeneratedAgentMarkdownFiles(liteConfig, options.configDir);
+            const updatedAgents = await updateGeneratedAgentMarkdownFiles(
+              liteConfig,
+              options.configDir,
+              resolveProjectRoot(context),
+            );
             const updatedEffectiveConfig = withLiteConfigAppliedToOpenCodeConfig(
               withConfiguredTaskLeadProfiles(config, options),
               liteConfig,
@@ -1595,6 +1783,7 @@ If no provider models are found, tell the user to configure or connect OpenCode 
               formatModelConfigReport({
                 roles: summarizeRoleModels(updatedEffectiveConfig),
                 taskLeadProfiles: summarizeTaskLeadProfileModels(updatedEffectiveConfig),
+                specialists: summarizeSpecialists(liteConfig),
                 models: importedPool,
                 changed: result.changed,
                 skipped: result.skipped,
@@ -1604,6 +1793,9 @@ If no provider models are found, tell the user to configure or connect OpenCode 
                 profileWarnings: profileLiteResult.warnings,
                 reasoningChanged: reasoningResult.changed,
                 reasoningSkipped: reasoningResult.skipped,
+                specialistChanged: specialistResult.changed,
+                specialistSkipped: specialistResult.skipped,
+                specialistWarnings: specialistResult.warnings,
               }),
               ...(profileReasoningResult.changed.length > 0
                 ? [

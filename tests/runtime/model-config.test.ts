@@ -16,7 +16,9 @@ import {
   resolveAutoReasoningEffortAssignments,
   resolveAutoTaskLeadProfileModels,
   summarizeRoleModels,
+  summarizeSpecialists,
   summarizeTaskLeadProfileModels,
+  applySpecialistAssignments,
 } from "../../.opencode/lib/runtime/model-config.js";
 import {
   applyLiteRoleReasoningEffortConfig,
@@ -27,6 +29,68 @@ import {
 } from "../../.opencode/lib/runtime/lite-config.js";
 
 describe("role model configuration", () => {
+  it("summarizes registered specialists and their configured boundaries", () => {
+    const summary = summarizeSpecialists({
+      specialists: {
+        "security-audit": {
+          name: "security-audit",
+          description: "Audit security-sensitive code.",
+          model: "anthropic/claude-sonnet-4-6",
+          reasoningEffort: "high",
+          editFolders: ["src/security"],
+          allowBash: false,
+        },
+      },
+    });
+
+    expect(summary).toEqual([{
+      name: "security-audit",
+      description: "Audit security-sensitive code.",
+      configuredModel: "anthropic/claude-sonnet-4-6",
+      configuredReasoningEffort: "high",
+      editFolders: ["src/security"],
+      allowBash: false,
+    }]);
+  });
+
+  it("applies model and reasoning assignments only to registered specialists", () => {
+    const config = {
+      specialists: {
+        "security-audit": {
+          name: "security-audit",
+          description: "Audit security-sensitive code.",
+        },
+      },
+    } as unknown as Parameters<typeof applySpecialistAssignments>[0];
+
+    const result = applySpecialistAssignments(
+      config,
+      {
+        "security-audit": {
+          model: "anthropic/claude-sonnet-4-6",
+          reasoningEffort: "xhigh",
+        },
+        unknown: {
+          model: "openai/gpt-5.4",
+        },
+      },
+      ["anthropic/claude-sonnet-4-6"],
+    );
+
+    expect(result.changed).toEqual([{
+      specialist: "security-audit",
+      model: "anthropic/claude-sonnet-4-6",
+      reasoningEffort: "xhigh",
+    }]);
+    expect(result.skipped).toEqual([{
+      specialist: "unknown",
+      reason: "specialist is not registered",
+    }]);
+    expect(config.specialists?.["security-audit"]).toMatchObject({
+      model: "anthropic/claude-sonnet-4-6",
+      reasoningEffort: "xhigh",
+    });
+  });
   it("lists provider models from OpenCode config", () => {
     const models = listProviderModels({
       provider: {

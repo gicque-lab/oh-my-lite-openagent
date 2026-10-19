@@ -9,6 +9,7 @@ import {
   type ProviderModelLike,
   type TaskLeadProfileSelection,
 } from "./task-lead-profiles.js";
+import type { LiteReasoningEffort } from "./lite-config.js";
 
 export interface PlanSubtask {
   id: string;
@@ -33,6 +34,7 @@ export interface TaskDispatchConfig {
   attributePriority: string[];
   profileModelMap: Record<string, string>;
   profileFallbackModelMap: Record<string, string[]>;
+  profileReasoningEffortMap: Record<string, LiteReasoningEffort>;
   availableModels: ProviderModelLike[];
 }
 
@@ -78,6 +80,7 @@ export const DEFAULT_TASK_DISPATCH_CONFIG: TaskDispatchConfig = {
   ],
   profileModelMap: {},
   profileFallbackModelMap: {},
+  profileReasoningEffortMap: {},
   availableModels: [],
 };
 
@@ -110,6 +113,7 @@ export function normalizeTaskDispatchConfig(
     attributePriority: input.attributePriority ?? DEFAULT_TASK_DISPATCH_CONFIG.attributePriority,
     profileModelMap: input.profileModelMap ?? DEFAULT_TASK_DISPATCH_CONFIG.profileModelMap,
     profileFallbackModelMap: input.profileFallbackModelMap ?? DEFAULT_TASK_DISPATCH_CONFIG.profileFallbackModelMap,
+    profileReasoningEffortMap: input.profileReasoningEffortMap ?? DEFAULT_TASK_DISPATCH_CONFIG.profileReasoningEffortMap,
     availableModels: input.availableModels ?? DEFAULT_TASK_DISPATCH_CONFIG.availableModels,
   };
 }
@@ -206,6 +210,7 @@ export function resolveDispatchProfile(
     attributePriority: config.attributePriority,
     profileModelMap: config.profileModelMap,
     profileFallbackModelMap: config.profileFallbackModelMap,
+    profileReasoningEffortMap: config.profileReasoningEffortMap,
     availableModels: config.availableModels,
   });
 }
