@@ -1,0 +1,17 @@
+{
+  "name": "opencode-compat-echo-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "C01 fixture: dual v1/v2 directory entrypoint with one harmless echo tool. Test scaffolding only.",
+  "exports": {
+    "./server": {
+      "import": "./server.ts",
+      "types": "./server.ts"
+    }
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.19.1",
+    "zod": "4.1.8"
+  }
+}
