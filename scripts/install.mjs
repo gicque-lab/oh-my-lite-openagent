@@ -9,7 +9,18 @@ import { MANAGED_CONFIG } from "./managed-config.mjs";
 const PLUGIN_FILE = "bounded-lite.ts";
 const MANAGED_DIRS = ["agents", "plugins", "lib"];
 const LITE_CONFIG_FILE = "oh-my-lite-openagent.json";
-const DEFAULT_PLUGIN_OPTIONS = { mode: "full" };
+/**
+ * keep in sync with .opencode/lib/compat/config.ts (MANAGED_PLUGIN_SPECS):
+ * exact managed specs only — strings that merely contain "bounded-lite.ts"
+ * belong to users and must never be classified or rewritten as managed.
+ */
+const MANAGED_PLUGIN_SPECS = [
+  "./.opencode/plugins/bounded-lite.ts",
+];
+const NATIVE_PERMISSION_ACTION_NAMES = {
+  bash: "shell",
+  task: "subagent",
+};
 const MANAGED_COMMAND_NAMES = new Set([
   "agent-models",
   "go",
@@ -639,33 +650,325 @@ async function copyDir(sourceDir, targetDir, dryRun) {
   }
 }
 
-function isManagedPluginSpec(spec) {
-  const value = Array.isArray(spec) ? spec[0] : spec;
-  return typeof value === "string" && value.includes(PLUGIN_FILE);
-}
+// ---------------------------------------------------------------------------
+// Config dialect helpers
+// keep in sync with .opencode/lib/compat/config.ts — the installer runs under
+// plain Node and cannot import the TypeScript boundary, so the small
+// read/update helpers are mirrored here and locked by parity tests.
+// ---------------------------------------------------------------------------
 
-function relativePluginSpec(configDir, taskLeadProfiles) {
-  return [
-    "./.opencode/plugins/bounded-lite.ts",
-    {
-      ...DEFAULT_PLUGIN_OPTIONS,
-      configDir,
-      ...(isRecord(taskLeadProfiles) ? { taskLeadProfiles } : {}),
-    },
-  ];
-}
-
-function isRecord(value) {
+export function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function mergeManagedAgent(sourceAgent, existingAgent) {
-  if (!isRecord(sourceAgent)) return sourceAgent;
-  if (!isRecord(existingAgent)) return { ...sourceAgent };
+export function detectConfigDialect(config) {
+  const legacyOnlyKeys = new Set(["plugin", "agent", "command", "permission", "provider"]);
+  const nativeOnlyKeys = new Set(["plugins", "agents", "commands", "permissions", "providers"]);
+  const legacyKeys = [];
+  const nativeKeys = [];
 
+  for (const key of Object.keys(config)) {
+    if (config[key] === undefined) continue;
+    if (legacyOnlyKeys.has(key)) legacyKeys.push(key);
+    else if (nativeOnlyKeys.has(key)) nativeKeys.push(key);
+  }
+
+  const dialect = legacyKeys.length > 0 && nativeKeys.length > 0
+    ? "mixed"
+    : nativeKeys.length > 0
+      ? "native"
+      : "legacy";
+  return { dialect, legacyKeys, nativeKeys };
+}
+
+export function parseModelReference(value) {
+  if (typeof value !== "string") return undefined;
+  const reference = value.trim();
+  if (!reference) return undefined;
+
+  const hash = reference.indexOf("#");
+  const base = hash >= 0 ? reference.slice(0, hash) : reference;
+  const rawVariant = hash >= 0 ? reference.slice(hash + 1) : undefined;
+  const slash = base.indexOf("/");
+  if (slash <= 0) return undefined;
+
+  const provider = base.slice(0, slash);
+  const model = base.slice(slash + 1);
+  if (!provider || !model) return undefined;
+  const variant = rawVariant === undefined ? undefined : rawVariant.trim();
+  if (rawVariant !== undefined && !variant) return undefined;
+
+  const baseId = `${provider}/${model}`;
   return {
-    ...sourceAgent,
-    ...(typeof existingAgent.model === "string" ? { model: existingAgent.model } : {}),
+    provider,
+    model,
+    ...(variant ? { variant } : {}),
+    baseId,
+    reference: variant ? `${baseId}#${variant}` : baseId,
+  };
+}
+
+function classifyPluginEntryValue(container, index, value) {
+  if (typeof value === "string") {
+    const removal = value.startsWith("-");
+    return { container, index, packageSpec: removal ? value.slice(1) : value, removal };
+  }
+
+  if (container === "native" && isRecord(value)) {
+    const packageSpec = value["package"];
+    if (typeof packageSpec !== "string" || !packageSpec) return undefined;
+    const options = isRecord(value["options"]) ? value["options"] : undefined;
+    return { container, index, packageSpec, ...(options ? { options } : {}), removal: false };
+  }
+
+  if (container === "legacy" && Array.isArray(value)) {
+    const packageSpec = value[0];
+    if (typeof packageSpec !== "string" || !packageSpec) return undefined;
+    const options = isRecord(value[1]) ? value[1] : undefined;
+    return { container, index, packageSpec, ...(options ? { options } : {}), removal: false };
+  }
+
+  return undefined;
+}
+
+export function readPluginEntries(config) {
+  const entries = [];
+
+  const legacyValue = config["plugin"];
+  if (typeof legacyValue === "string") {
+    const entry = classifyPluginEntryValue("legacy", 0, legacyValue);
+    if (entry) entries.push(entry);
+  } else if (Array.isArray(legacyValue)) {
+    legacyValue.forEach((item, index) => {
+      const entry = classifyPluginEntryValue("legacy", index, item);
+      if (entry) entries.push(entry);
+    });
+  }
+
+  const nativeValue = config["plugins"];
+  if (Array.isArray(nativeValue)) {
+    nativeValue.forEach((item, index) => {
+      const entry = classifyPluginEntryValue("native", index, item);
+      if (entry) entries.push(entry);
+    });
+  }
+
+  return entries;
+}
+
+export function isManagedPluginEntry(entry) {
+  return MANAGED_PLUGIN_SPECS.includes(entry.packageSpec);
+}
+
+export function managedPluginOptions(config) {
+  const managed = readPluginEntries(config)
+    .filter(isManagedPluginEntry)
+    .filter((entry) => !entry.removal && entry.options);
+
+  const legacy = managed.filter((entry) => entry.container === "legacy");
+  const native = managed.filter((entry) => entry.container === "native");
+  const lastOptions = (list) => (list.length > 0 ? list[list.length - 1].options : undefined);
+
+  return lastOptions(native) ?? lastOptions(legacy) ?? {};
+}
+
+export function removeManagedPluginEntries(config, container) {
+  for (const key of ["plugin", "plugins"]) {
+    if (container === "legacy" && key !== "plugin") continue;
+    if (container === "native" && key !== "plugins") continue;
+    const value = config[key];
+    if (!Array.isArray(value)) continue;
+    config[key] = value.filter((item) => {
+      const entry = classifyPluginEntryValue(key === "plugin" ? "legacy" : "native", 0, item);
+      return !(entry && isManagedPluginEntry(entry) && !entry.removal);
+    });
+  }
+}
+
+export function upsertManagedPluginEntry(config, spec, options) {
+  const info = detectConfigDialect(config);
+  const targetNative = Array.isArray(config["plugins"]) || info.dialect === "native" || info.dialect === "mixed";
+
+  if (targetNative) {
+    // Managed value lives only in the effective native location; drop legacy
+    // shadows but keep native array positions intact.
+    removeManagedPluginEntries(config, "legacy");
+    const plugins = Array.isArray(config["plugins"]) ? [...config["plugins"]] : [];
+    const index = plugins.findIndex((item) => {
+      const entry = classifyPluginEntryValue("native", 0, item);
+      return Boolean(entry && !entry.removal && entry.packageSpec === spec);
+    });
+
+    if (index >= 0) {
+      const existing = plugins[index];
+      const extraEntryKeys = isRecord(existing)
+        ? Object.fromEntries(Object.entries(existing).filter(([key]) => key !== "package" && key !== "options"))
+        : {};
+      plugins[index] = { ...extraEntryKeys, package: spec, options };
+    } else {
+      plugins.push({ package: spec, options });
+    }
+    config["plugins"] = plugins;
+    return;
+  }
+
+  const pluginValue = config["plugin"];
+  const plugins = Array.isArray(pluginValue)
+    ? [...pluginValue]
+    : typeof pluginValue === "string"
+      ? [pluginValue]
+      : [];
+  const index = plugins.findIndex((item) => {
+    const entry = classifyPluginEntryValue("legacy", 0, item);
+    return Boolean(entry && !entry.removal && isManagedPluginEntry(entry));
+  });
+
+  if (index >= 0) {
+    plugins[index] = [spec, options];
+  } else {
+    plugins.push([spec, options]);
+  }
+  config["plugin"] = plugins;
+}
+
+export function nativeAgentEntries(config) {
+  return isRecord(config["agents"]) ? config["agents"] : undefined;
+}
+
+export function legacyAgentEntries(config) {
+  return isRecord(config["agent"]) ? config["agent"] : undefined;
+}
+
+export function mergedAgentEntries(config) {
+  return { ...(legacyAgentEntries(config) ?? {}), ...(nativeAgentEntries(config) ?? {}) };
+}
+
+export function mergedProviderEntries(config) {
+  const legacy = isRecord(config["provider"]) ? config["provider"] : {};
+  const native = isRecord(config["providers"]) ? config["providers"] : {};
+  return { ...legacy, ...native };
+}
+
+export function nativeMcpServers(config) {
+  const mcp = isRecord(config["mcp"]) ? config["mcp"] : undefined;
+  return mcp && isRecord(mcp["servers"]) ? mcp["servers"] : undefined;
+}
+
+export function readNativePermissions(config) {
+  const value = config["permissions"];
+  if (!Array.isArray(value)) return { rules: [], malformed: [] };
+
+  const rules = [];
+  const malformed = [];
+  value.forEach((raw, index) => {
+    if (!isRecord(raw) || typeof raw["action"] !== "string") {
+      malformed.push({ index, raw });
+      return;
+    }
+    rules.push({
+      index,
+      raw,
+      action: raw["action"],
+      ...(typeof raw["resource"] === "string" ? { resource: raw["resource"] } : {}),
+      ...(typeof raw["effect"] === "string" ? { effect: raw["effect"] } : {}),
+    });
+  });
+  return { rules, malformed };
+}
+
+export function appendNativePermissionRules(config, rules) {
+  if (rules.length === 0) return;
+  const existing = Array.isArray(config["permissions"]) ? config["permissions"] : [];
+  config["permissions"] = [
+    ...existing,
+    ...rules.map((rule) => ({
+      action: rule.action,
+      ...(rule.resource !== undefined ? { resource: rule.resource } : {}),
+      effect: rule.effect,
+    })),
+  ];
+}
+
+export function findManagedConfigConflicts(config, managedAgentNames) {
+  const conflicts = [];
+  const managedNames = new Set(managedAgentNames);
+
+  const agents = nativeAgentEntries(config);
+  if (agents) {
+    for (const [name, raw] of Object.entries(agents)) {
+      if (!managedNames.has(name) || !isRecord(raw)) continue;
+      conflicts.push({
+        location: `agents.${JSON.stringify(name)}`,
+        kind: "native-managed-agent-entry",
+        detail: `Native agents entry would shadow the generated agents/${name}.md managed definition (keys: ${Object.keys(raw).join(", ") || "<none>"}).`,
+        guidance: 'Remove the entry from the native "agents" map (or adopt your entry as the authoritative definition and take over managing that agent) and run the installer again.',
+      });
+    }
+  }
+
+  for (const entry of readPluginEntries(config)) {
+    if (!entry.removal || !isManagedPluginEntry(entry)) continue;
+    conflicts.push({
+      location: entry.container === "native"
+        ? `plugins[${JSON.stringify(`-${entry.packageSpec}`)}]`
+        : `plugin[${JSON.stringify(`-${entry.packageSpec}`)}]`,
+      kind: "managed-plugin-removal",
+      detail: "The configuration explicitly disables the managed plugin entry.",
+      guidance: "Remove the removal entry (or intentionally stop using the managed plugin) and run the installer again.",
+    });
+  }
+
+  const permissionsValue = config["permissions"];
+  if (permissionsValue !== undefined) {
+    if (!Array.isArray(permissionsValue)) {
+      conflicts.push({
+        location: "permissions",
+        kind: "native-permissions-shape",
+        detail: 'The native "permissions" key exists but is not the documented ordered rule array; its rule format cannot be classified safely.',
+        guidance: 'Convert "permissions" to an array of {action, resource, effect} rules (or remove it and rerun the installer; a backup of the previous file is kept before any write).',
+      });
+    } else {
+      for (const item of readNativePermissions(config).malformed) {
+        conflicts.push({
+          location: `permissions[${item.index}]`,
+          kind: "native-permission-rule",
+          detail: "Native permission rule entry cannot be classified as an {action, resource, effect} rule without guessing.",
+          guidance: 'Give the entry a string "action" (and string "resource"/"effect" fields) or remove it, then run the installer again.',
+        });
+      }
+    }
+  }
+
+  return conflicts;
+}
+
+/**
+ * Native projection of the managed permission policy: ordered rules with
+ * broad-first/specific-last ordering preserved from the managed maps, action
+ * names mapped to the documented v2 set (bash→shell, task→subagent).
+ */
+export function nativeManagedPermissionRules(permissionMap) {
+  const rules = [];
+  if (!isRecord(permissionMap)) return rules;
+
+  for (const [action, value] of Object.entries(permissionMap)) {
+    const nativeAction = NATIVE_PERMISSION_ACTION_NAMES[action] ?? action;
+    if (isRecord(value)) {
+      for (const [resource, effect] of Object.entries(value)) {
+        rules.push({ action: nativeAction, resource, effect });
+      }
+    } else if (typeof value === "string") {
+      rules.push({ action: nativeAction, resource: "*", effect: value });
+    }
+  }
+  return rules;
+}
+
+function relativePluginOptions(configDir, taskLeadProfiles) {
+  return {
+    mode: "full",
+    configDir,
+    ...(isRecord(taskLeadProfiles) ? { taskLeadProfiles } : {}),
   };
 }
 
@@ -714,13 +1017,18 @@ function mergeLiteConfig(existingLiteConfig, existingOpenCodeConfig) {
       ...(isRecord(existingLiteConfig?.modelPoolPolicy) ? existingLiteConfig.modelPoolPolicy : {}),
     },
   };
-  const agents = isRecord(existingOpenCodeConfig.agent) ? existingOpenCodeConfig.agent : {};
+  // Effective entries: native `agents` shadows same-name legacy `agent` entries;
+  // model references keep an explicit `#variant` intact.
+  const agents = mergedAgentEntries(existingOpenCodeConfig);
 
   for (const roleName of MANAGED_AGENT_NAMES) {
     if (BUILTIN_AGENT_OVERRIDES.has(roleName)) continue;
     const agent = isRecord(agents[roleName]) ? agents[roleName] : {};
-    if (!liteConfig.roleModels[roleName] && typeof agent.model === "string" && agent.model.includes("/")) {
-      liteConfig.roleModels[roleName] = agent.model;
+    if (agent.disable === true || agent.disabled === true) continue;
+    const modelRef = parseModelReference(agent.model);
+    const model = modelRef ? modelRef.reference : undefined;
+    if (!liteConfig.roleModels[roleName] && model) {
+      liteConfig.roleModels[roleName] = model;
     }
     const effort = normalizeReasoningEffort(agent.reasoningEffort);
     if (!liteConfig.roleReasoningEffort[roleName] && effort) {
@@ -728,22 +1036,26 @@ function mergeLiteConfig(existingLiteConfig, existingOpenCodeConfig) {
     }
   }
 
-  const legacyProfiles = isRecord(existingOpenCodeConfig.taskLeadProfiles)
-    ? existingOpenCodeConfig.taskLeadProfiles
-    : {};
-  for (const [profileName, profileValue] of Object.entries(legacyProfiles)) {
+  // Profile preferences: managed plugin options are the effective source;
+  // existing lite-config choices always win over migration defaults.
+  const pluginProfiles = managedPluginOptions(existingOpenCodeConfig);
+  const profilesSource = isRecord(pluginProfiles.taskLeadProfiles)
+    ? pluginProfiles.taskLeadProfiles
+    : (isRecord(existingOpenCodeConfig.taskLeadProfiles) ? existingOpenCodeConfig.taskLeadProfiles : {});
+  for (const [profileName, profileValue] of Object.entries(profilesSource)) {
     if (!isRecord(profileValue)) continue;
     const profile = isRecord(liteConfig.taskLeadProfiles[profileName])
       ? { ...liteConfig.taskLeadProfiles[profileName] }
       : {};
-    if (!profile.model && typeof profileValue.model === "string" && profileValue.model.includes("/")) {
-      profile.model = profileValue.model;
-    }
+    const modelRef = parseModelReference(profileValue.model);
+    const model = modelRef ? modelRef.reference : undefined;
+    if (!profile.model && model) profile.model = model;
     const effort = normalizeReasoningEffort(profileValue.reasoningEffort);
     if (!profile.reasoningEffort && effort) profile.reasoningEffort = effort;
     if (Array.isArray(profileValue.fallbackModels) && !profile.fallbackModels) {
       profile.fallbackModels = profileValue.fallbackModels.filter((item) => typeof item === "string");
     }
+    // Existing lite-config choices win; migration only backfills missing keys.
     if (Object.keys(profile).length > 0) liteConfig.taskLeadProfiles[profileName] = profile;
   }
 
@@ -819,21 +1131,6 @@ function isSafeRelativeFilePath(value) {
   return !normalized.split("/").some((segment) => segment === "..");
 }
 
-function readManagedPluginOptions(config) {
-  const plugins = Array.isArray(config.plugin)
-    ? config.plugin
-    : config.plugin
-      ? [config.plugin]
-      : [];
-
-  for (const spec of plugins) {
-    if (!isManagedPluginSpec(spec)) continue;
-    if (Array.isArray(spec) && isRecord(spec[1])) return spec[1];
-  }
-
-  return {};
-}
-
 function mergePermission(existingPermission, sourcePermission) {
   if (!isRecord(existingPermission)) return sourcePermission;
   if (!isRecord(sourcePermission)) return existingPermission;
@@ -845,67 +1142,166 @@ function mergePermission(existingPermission, sourcePermission) {
   };
 }
 
-function mergeMcp(existingMcp, sourceMcp, managedMcp = true) {
-  if (!managedMcp || !isRecord(sourceMcp)) return existingMcp;
+/**
+ * Native permission backfill: user rules keep their exact order and are never
+ * object-spread or sorted. Managed rules are appended only for actions the
+ * user does not own (explicit user restrictions win and are preserved).
+ */
+function backfillNativePermissions(existingConfig, sourceConfig) {
+  const read = readNativePermissions(existingConfig);
+  const userOwnedActions = new Set(read.rules.map((rule) => rule.action));
+  const legacyPermission = isRecord(existingConfig.permission) ? existingConfig.permission : {};
+  for (const [action] of Object.entries(legacyPermission)) {
+    userOwnedActions.add(NATIVE_PERMISSION_ACTION_NAMES[action] ?? action);
+  }
+
+  const backfill = nativeManagedPermissionRules(
+    isRecord(sourceConfig.permission) ? sourceConfig.permission : {},
+  ).filter((rule) => !userOwnedActions.has(rule.action));
+
+  return [
+    ...existingConfig.permissions,
+    ...backfill,
+  ];
+}
+
+function mergeMcpDialectAware(existingConfig, sourceConfig, managedMcp = true, isNativeTarget = false) {
+  if (!managedMcp || !isRecord(sourceConfig.mcp)) return existingConfig.mcp;
   const managedSourceMcp = Object.fromEntries(
-    Object.entries(sourceMcp).filter(([serverName]) => MANAGED_MCP_NAMES.has(serverName)),
+    Object.entries(sourceConfig.mcp).filter(([serverName]) => MANAGED_MCP_NAMES.has(serverName)),
   );
-  if (!isRecord(existingMcp)) return managedSourceMcp;
+  const existing = isRecord(existingConfig.mcp) ? existingConfig.mcp : {};
+  const existingServers = isRecord(existing.servers) ? existing.servers : undefined;
+
+  if (isNativeTarget || existingServers) {
+    const servers = existingServers ? { ...existingServers } : {};
+    for (const [serverName, config] of Object.entries(managedSourceMcp)) {
+      // User-owned entries (either the direct v1 map or native servers) win;
+      // managed defaults only backfill missing names.
+      const directOwned = existing[serverName] !== undefined;
+      if (servers[serverName] === undefined && !directOwned) servers[serverName] = config;
+    }
+    return { ...existing, servers };
+  }
 
   return {
     ...managedSourceMcp,
-    ...existingMcp,
+    ...existing,
   };
 }
 
 function mergeConfig(existingConfig, sourceConfig, configDir, options = {}) {
-  const legacyTaskLeadProfiles = isRecord(existingConfig.taskLeadProfiles)
-    ? existingConfig.taskLeadProfiles
-    : undefined;
-  const managedPluginOptions = readManagedPluginOptions(existingConfig);
-  const pluginTaskLeadProfiles = isRecord(managedPluginOptions.taskLeadProfiles)
-    ? managedPluginOptions.taskLeadProfiles
-    : undefined;
-  const taskLeadProfiles = pluginTaskLeadProfiles ?? legacyTaskLeadProfiles;
-  const {
-    taskLeadProfiles: _legacyTaskLeadProfiles,
-    agent: _existingAgents,
-    ...existingWithoutLegacyProfiles
-  } = existingConfig;
-  const existingPlugins = Array.isArray(existingConfig.plugin)
-    ? existingConfig.plugin
-    : existingConfig.plugin
-      ? [existingConfig.plugin]
-      : [];
+  const info = detectConfigDialect(existingConfig);
+  const isNativeTarget = info.dialect === "native" || info.dialect === "mixed";
 
-  const plugins = [
-    ...existingPlugins.filter((spec) => !isManagedPluginSpec(spec)),
-    relativePluginSpec(configDir, taskLeadProfiles),
-  ];
-  const existingAgents = isRecord(existingConfig.agent) ? existingConfig.agent : {};
-  const customAgents = Object.fromEntries(
-    Object.entries(existingConfig.agent ?? {}).filter(([agentName]) => (
+  // Effective managed plugin options: native entries win on mixed files.
+  const existingManagedOptions = managedPluginOptions(existingConfig);
+  const taskLeadProfiles = isRecord(existingManagedOptions.taskLeadProfiles)
+    ? existingManagedOptions.taskLeadProfiles
+    : undefined;
+
+  // Plugin containers: remove exact managed entries (both dialects, never user
+  // specs that merely contain the plugin filename), then upsert once in the
+  // effective container — native classed/mixed files get the native
+  // {package, options} form, legacy-classified files keep the v1 tuple.
+  const pluginContainers = {
+    plugin: Array.isArray(existingConfig.plugin)
+      ? [...existingConfig.plugin]
+      : typeof existingConfig.plugin === "string"
+        ? [existingConfig.plugin]
+        : undefined,
+    plugins: Array.isArray(existingConfig.plugins) ? [...existingConfig.plugins] : undefined,
+  };
+  removeManagedPluginEntries(pluginContainers);
+  upsertManagedPluginEntry(pluginContainers, MANAGED_PLUGIN_SPECS[0], relativePluginOptions(configDir, taskLeadProfiles));
+
+  // Legacy agent container: installer-owned managed + specialist names are
+  // removed; unrelated custom agents are preserved verbatim. The native
+  // `agents` container is user data here — it is preserved untouched (managed
+  // native entries fail the conflict gate before any write).
+  const legacyAgents = isRecord(existingConfig.agent) ? existingConfig.agent : {};
+  const customLegacyAgents = Object.fromEntries(
+    Object.entries(legacyAgents).filter(([agentName]) => (
       !MANAGED_AGENT_NAMES.has(agentName) &&
       !(options.specialistNames instanceof Set && options.specialistNames.has(agentName))
     )),
   );
+  const nativeAgents = nativeAgentEntries(existingConfig);
 
-  return {
-    ...existingWithoutLegacyProfiles,
-    $schema: existingConfig.$schema ?? sourceConfig.$schema,
-    plugin: plugins,
-    mcp: mergeMcp(existingConfig.mcp, sourceConfig.mcp, options.managedMcp),
-    default_agent: sourceConfig.default_agent,
-    permission: mergePermission(existingConfig.permission, sourceConfig.permission),
-    command: {
+  const managedCommandEntries = isRecord(sourceConfig.command) ? sourceConfig.command : {};
+  const writeLegacyCommands = isRecord(existingConfig.command) || !isNativeTarget;
+  const writeNativeCommands = isRecord(existingConfig.commands) || isNativeTarget;
+  const legacyCommandContainer = writeLegacyCommands
+    ? {
       ...Object.fromEntries(
-        Object.entries(existingConfig.command ?? {}).filter(([commandName]) => (
+        Object.entries(isRecord(existingConfig.command) ? existingConfig.command : {}).filter(([commandName]) => (
           !MANAGED_COMMAND_NAMES.has(commandName)
         )),
       ),
-      ...(sourceConfig.command ?? {}),
-    },
-    ...(Object.keys(customAgents).length > 0 ? { agent: customAgents } : {}),
+      ...managedCommandEntries,
+    }
+    : undefined;
+  const nativeCommandContainer = writeNativeCommands
+    ? {
+      ...Object.fromEntries(
+        Object.entries(isRecord(existingConfig.commands) ? existingConfig.commands : {}).filter(([commandName]) => (
+          !MANAGED_COMMAND_NAMES.has(commandName)
+        )),
+      ),
+      ...managedCommandEntries,
+    }
+    : undefined;
+
+  const hasNativePermissions = Array.isArray(existingConfig.permissions);
+  const hasLegacyPermission = isRecord(existingConfig.permission);
+  const writeLegacyPermission = hasLegacyPermission || !isNativeTarget;
+  let permissionOutput;
+  let permissionsOutput;
+  if (hasNativePermissions) {
+    // Native ordered rule array: user rules first in their original order,
+    // managed backfill appended per unowned action (never reordered).
+    permissionsOutput = backfillNativePermissions(existingConfig, sourceConfig);
+    // Native wins canonically on mixed files; the legacy permission map is
+    // user data and passes through untouched (never silently deleted).
+    permissionOutput = hasLegacyPermission ? existingConfig.permission : undefined;
+  } else if (writeLegacyPermission) {
+    permissionOutput = mergePermission(existingConfig.permission, sourceConfig.permission);
+  } else {
+    // Native-classified file without permission data: emit managed defaults
+    // as a v2-shaped ordered rule array, no v1 fields inside native entries.
+    permissionsOutput = nativeManagedPermissionRules(
+      isRecord(sourceConfig.permission) ? sourceConfig.permission : {},
+    );
+  }
+
+  const mcpOutput = mergeMcpDialectAware(existingConfig, sourceConfig, options.managedMcp, isNativeTarget);
+
+  const {
+    taskLeadProfiles: _legacyTaskLeadProfiles,
+    agent: _existingAgents,
+    command: _existingCommand,
+    commands: _existingCommands,
+    plugin: _existingPlugin,
+    plugins: _existingPlugins,
+    permission: _existingPermission,
+    permissions: _existingPermissions,
+    mcp: _existingMcp,
+    ...preservedExisting
+  } = existingConfig;
+
+  return {
+    ...preservedExisting,
+    $schema: existingConfig.$schema ?? sourceConfig.$schema,
+    ...(pluginContainers.plugin !== undefined ? { plugin: pluginContainers.plugin } : {}),
+    ...(pluginContainers.plugins !== undefined ? { plugins: pluginContainers.plugins } : {}),
+    ...(legacyCommandContainer ? { command: legacyCommandContainer } : {}),
+    ...(nativeCommandContainer ? { commands: nativeCommandContainer } : {}),
+    ...(mcpOutput !== undefined ? { mcp: mcpOutput } : {}),
+    default_agent: sourceConfig.default_agent,
+    ...(permissionOutput !== undefined ? { permission: permissionOutput } : {}),
+    ...(permissionsOutput !== undefined ? { permissions: permissionsOutput } : {}),
+    ...(Object.keys(customLegacyAgents).length > 0 ? { agent: customLegacyAgents } : {}),
+    ...(nativeAgents !== undefined ? { agents: nativeAgents } : {}),
   };
 }
 
@@ -932,9 +1328,21 @@ function buildUpdateLiteCommand(rootDir, configDir) {
 }
 
 function allowInstallScopedUpdateLite(config, context) {
+  const installCommand = buildUpdateLiteInstallCommand(context.rootDir, context.configDir);
+
+  if (Array.isArray(config.permissions)) {
+    // Native rule array: append the exact allow rule once, user order preserved.
+    const alreadyAllowed = readNativePermissions(config).rules.some((rule) => (
+      rule.action === "shell" && rule.resource === installCommand && rule.effect === "allow"
+    ));
+    if (!alreadyAllowed) {
+      appendNativePermissionRules(config, [{ action: "shell", resource: installCommand, effect: "allow" }]);
+    }
+    return config;
+  }
+
   const permission = isRecord(config.permission) ? config.permission : {};
   const bash = isRecord(permission.bash) ? permission.bash : {};
-  const installCommand = buildUpdateLiteInstallCommand(context.rootDir, context.configDir);
 
   return {
     ...config,
@@ -949,13 +1357,19 @@ function allowInstallScopedUpdateLite(config, context) {
 }
 
 function injectInstallScopedCommands(config, context) {
-  const withCommand = {
-    ...config,
-    command: {
-      ...(isRecord(config.command) ? config.command : {}),
-      "update-lite": buildUpdateLiteCommand(context.rootDir, context.configDir),
-    },
-  };
+  const updateLiteCommand = buildUpdateLiteCommand(context.rootDir, context.configDir);
+  if (updateLiteCommand === undefined) return { ...config };
+
+  const withCommand = { ...config };
+  // The effective native `commands` container wins on mixed files.
+  if (isRecord(withCommand.commands)) {
+    withCommand.commands = { ...withCommand.commands, "update-lite": updateLiteCommand };
+  } else {
+    withCommand.command = {
+      ...(isRecord(withCommand.command) ? withCommand.command : {}),
+      "update-lite": updateLiteCommand,
+    };
+  }
 
   return allowInstallScopedUpdateLite(withCommand, context);
 }
@@ -1181,6 +1595,27 @@ function mergeAll(context) {
   };
 }
 
+function installConflictNames(context, liteConfig) {
+  const specialistNames = Object.keys(liteConfig?.specialists ?? {});
+  return [...MANAGED_AGENT_NAMES, ...specialistNames];
+}
+
+function collectInstallConflicts(context, liteConfig) {
+  return findManagedConfigConflicts(context.existingConfig, installConflictNames(context, liteConfig));
+}
+
+function formatInstallConflicts(conflicts) {
+  return [
+    "Installer stopped before writing files: the existing OpenCode configuration contains entries that would conflict with or shadow managed values.",
+    "",
+    ...conflicts.map((conflict) => (
+      `- ${conflict.location} (${conflict.kind})\n  ${conflict.detail}\n  Guidance: ${conflict.guidance}`
+    )),
+    "",
+    "No files were written. Resolve the listed entries and run the installer again.",
+  ].join("\n");
+}
+
 async function copyManagedDirs(context) {
   for (const managedDir of MANAGED_DIRS) {
     await copyDir(
@@ -1228,6 +1663,14 @@ async function writeOutputs(context, mergedConfig, liteConfig) {
 export async function install(options = {}) {
   const context = await prepareInstallContext(options);
   const merged = mergeAll(context);
+
+  // Stop before any file mutation (or managed-dir copy) when existing native
+  // or mixed entries would shadow managed values and cannot be classified
+  // without guessing. Dry runs report the same gate and write nothing.
+  const conflicts = collectInstallConflicts(context, merged.liteConfig);
+  if (conflicts.length > 0) {
+    throw new Error(formatInstallConflicts(conflicts));
+  }
 
   await copyManagedDirs(context);
   const liteConfig = await runInteractiveSetup(merged.liteConfig, context);

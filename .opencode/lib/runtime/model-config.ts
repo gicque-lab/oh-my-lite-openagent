@@ -1,5 +1,11 @@
 import { ROLE_CONTRACTS, type RoleName } from "../contracts.js";
 import {
+  legacyAgentEntries,
+  mergedAgentEntries,
+  mergedProviderEntries,
+  parseModelReference,
+} from "../compat/config.js";
+import {
   type AutoModelResult,
   resolveAutoModels,
   ROLE_MODEL_PROFILES,
@@ -176,11 +182,12 @@ export interface ApplyRoleReasoningEffortConfigResult {
 }
 
 export function listProviderModels(config: Record<string, unknown>): ProviderModel[] {
-  const providerConfig = config["provider"];
+  // Effective entries: native `providers` shadows same-name legacy `provider` entries.
+  const providerConfig = mergedProviderEntries(config);
 
   let models: ProviderModel[] = [];
 
-  // Strategy 1: Read from explicit provider.models config (opencode.json "provider" key)
+  // Strategy 1: Read from explicit provider.models config (opencode.json "provider"/"providers" key)
   if (isRecord(providerConfig)) {
     for (const [provider, providerValue] of Object.entries(providerConfig)) {
       if (!isRecord(providerValue)) continue;
@@ -205,7 +212,8 @@ export function listProviderModels(config: Record<string, unknown>): ProviderMod
       // Check for direct apiKey format (provider with apiKey but no models list)
       // e.g. "openai": { "apiKey": "sk-..." } or "anthropic": { "apiKey": "sk-ant-..." }
       // These providers are connected but don't enumerate models in config
-      if (typeof providerValue["apiKey"] === "string" && !isRecord(providerValue["models"])) {
+      const connected = typeof providerValue["apiKey"] === "string" || isRecord(providerValue["settings"]);
+      if (connected && !isRecord(providerValue["models"])) {
         // Provider is connected but models must be discovered at runtime
       }
     }
@@ -216,41 +224,38 @@ export function listProviderModels(config: Record<string, unknown>): ProviderMod
   // This catches cases where providers were connected via /connect but their
   // models aren't listed in opencode.json — the models may already be configured
   // on individual agents.
-  const agents = isRecord(config["agent"]) ? config["agent"] : {};
-  const globalModel = typeof config["model"] === "string" ? config["model"] : undefined;
+  const agents = mergedAgentEntries(config);
+  const globalModelRef = parseModelReference(config["model"]);
+  const globalModel = globalModelRef ? globalModelRef.reference : undefined;
   const seenIds = new Set(models.map((m) => m.id));
 
-  if (globalModel && globalModel.includes("/")) {
-    const parts = globalModel.split("/");
-    if (parts.length === 2 && !seenIds.has(globalModel)) {
-      models.push({
-        provider: parts[0]!,
-        model: parts[1]!,
-        id: globalModel,
-        source: classifyModelProvider(parts[0]!),
-        family: classifyModelFamily(globalModel),
-        origin: "configured-model",
-      });
-      seenIds.add(globalModel);
-    }
+  if (globalModel && !seenIds.has(globalModel)) {
+    models.push({
+      provider: globalModelRef!.provider,
+      model: globalModelRef!.model,
+      id: globalModel,
+      source: classifyModelProvider(globalModelRef!.provider),
+      family: classifyModelFamily(globalModel),
+      origin: "configured-model",
+    });
+    seenIds.add(globalModel);
   }
 
   for (const agentValue of Object.values(agents)) {
     if (!isRecord(agentValue)) continue;
-    const agentModel = typeof agentValue["model"] === "string" ? agentValue["model"] : undefined;
-    if (agentModel && agentModel.includes("/")) {
-      const parts = agentModel.split("/");
-      if (parts.length === 2 && !seenIds.has(agentModel)) {
-        models.push({
-          provider: parts[0]!,
-          model: parts[1]!,
-          id: agentModel,
-          source: classifyModelProvider(parts[0]!),
-          family: classifyModelFamily(agentModel),
-          origin: "configured-model",
-        });
-        seenIds.add(agentModel);
-      }
+    if (agentValue["disable"] === true || agentValue["disabled"] === true) continue;
+    const agentModelRef = parseModelReference(agentValue["model"]);
+    const agentModel = agentModelRef ? agentModelRef.reference : undefined;
+    if (agentModel && !seenIds.has(agentModel)) {
+      models.push({
+        provider: agentModelRef!.provider,
+        model: agentModelRef!.model,
+        id: agentModel,
+        source: classifyModelProvider(agentModelRef!.provider),
+        family: classifyModelFamily(agentModel),
+        origin: "configured-model",
+      });
+      seenIds.add(agentModel);
     }
   }
 
@@ -263,19 +268,17 @@ export function listProviderModels(config: Record<string, unknown>): ProviderMod
     ];
 
     for (const profileModel of profileModels) {
-      if (profileModel && profileModel.includes("/")) {
-        const parts = profileModel.split("/");
-        if (parts.length === 2 && !seenIds.has(profileModel)) {
-          models.push({
-            provider: parts[0]!,
-            model: parts[1]!,
-            id: profileModel,
-            source: classifyModelProvider(parts[0]!),
-            family: classifyModelFamily(profileModel),
-            origin: "configured-model",
-          });
-          seenIds.add(profileModel);
-        }
+      const profileRef = parseModelReference(profileModel);
+      if (profileRef && !seenIds.has(profileRef.reference)) {
+        models.push({
+          provider: profileRef.provider,
+          model: profileRef.model,
+          id: profileRef.reference,
+          source: classifyModelProvider(profileRef.provider),
+          family: classifyModelFamily(profileRef.reference),
+          origin: "configured-model",
+        });
+        seenIds.add(profileRef.reference);
       }
     }
   }
@@ -422,12 +425,15 @@ export function inferModelPoolPolicy(
 }
 
 export function summarizeRoleModels(config: Record<string, unknown>): RoleModelSummary[] {
-  const globalModel = typeof config["model"] === "string" ? config["model"] : undefined;
-  const agents = isRecord(config["agent"]) ? config["agent"] : {};
+  const globalModelRef = parseModelReference(config["model"]);
+  const globalModel = globalModelRef ? globalModelRef.reference : undefined;
+  // Effective entries: native `agents` shadows same-name legacy `agent` entries.
+  const agents = mergedAgentEntries(config);
 
   return CONFIGURABLE_ROLE_NAMES.map((role) => {
     const agent = isRecord(agents[role]) ? agents[role] : {};
-    const configuredModel = typeof agent["model"] === "string" ? agent["model"] : undefined;
+    const configuredModelRef = parseModelReference(agent["model"]);
+    const configuredModel = configuredModelRef ? configuredModelRef.reference : undefined;
     const configuredReasoningEffort = readReasoningEffort(agent);
     const mode = typeof agent["mode"] === "string" ? agent["mode"] : undefined;
     const effectiveModel = configuredModel ?? globalModel;
@@ -444,16 +450,20 @@ export function summarizeRoleModels(config: Record<string, unknown>): RoleModelS
 }
 
 export function summarizeTaskLeadProfileModels(config: Record<string, unknown>): TaskLeadProfileModelSummary[] {
-  const agents = isRecord(config["agent"]) ? config["agent"] : {};
+  const agents = mergedAgentEntries(config);
   const taskLead = isRecord(agents["task-lead"]) ? agents["task-lead"] : {};
-  const globalModel = typeof config["model"] === "string" ? config["model"] : undefined;
-  const taskLeadModel = typeof taskLead["model"] === "string" ? taskLead["model"] : globalModel;
+  const globalModelRef = parseModelReference(config["model"]);
+  const globalModel = globalModelRef ? globalModelRef.reference : undefined;
+  const taskLeadModelRef = parseModelReference(taskLead["model"]);
+  const taskLeadModel = taskLeadModelRef ? taskLeadModelRef.reference : globalModel;
   const profileConfig = isRecord(config["taskLeadProfiles"]) ? config["taskLeadProfiles"] : {};
 
   return DEFAULT_TASK_LEAD_PROFILES.map((profile) => {
     const rawConfigured = profileConfig[profile.name];
     const configured: Record<string, unknown> = isRecord(rawConfigured) ? rawConfigured : {};
-    const configuredModel = typeof configured["model"] === "string" ? configured["model"] : undefined;
+    const configuredModelRef = parseModelReference(configured["model"]);
+    const configuredModel = configuredModelRef ? configuredModelRef.reference
+      : (typeof configured["model"] === "string" ? configured["model"] : undefined);
     const fallbackModels = readStringArray(configured["fallbackModels"]);
     const effectiveModel = configuredModel ?? taskLeadModel;
 
@@ -576,7 +586,11 @@ export function applyRoleModelConfig(
   availableModelIds: readonly string[] = [],
   options: { allowUnavailableModels?: boolean } = {},
 ): ApplyModelConfigResult {
-  const agents = ensureRecord(config, "agent");
+  // Effective container: managed roles read from native `agents` when present
+  // (so updated values still target the effective entries, not shadowed legacy
+  // fields); legacy-classified configs keep the v1 `agent` map.
+  const useNativeAgentContainer = isRecord(config["agents"]);
+  const agents = ensureRecord(config, useNativeAgentContainer ? "agents" : "agent");
   const validRoles = new Set<string>(CONFIGURABLE_ROLE_NAMES);
   const availableModels = new Set(availableModelIds);
   const changed: ApplyModelConfigResult["changed"] = [];
@@ -595,8 +609,8 @@ export function applyRoleModelConfig(
     }
 
     const model = modelValue.trim();
-
-    if (!model.includes("/")) {
+    const parsed = parseModelReference(model);
+    if (!parsed) {
       skipped.push({ role, reason: "model must use provider/model format" });
       continue;
     }
@@ -606,7 +620,7 @@ export function applyRoleModelConfig(
       continue;
     }
 
-    if (availableModels.size > 0 && !availableModels.has(model)) {
+    if (availableModels.size > 0 && !availableModels.has(model) && !availableModels.has(parsed.baseId)) {
       if (!options.allowUnavailableModels) {
         skipped.push({ role, reason: "model is not in the imported model pool" });
         continue;
@@ -656,8 +670,8 @@ export function applyTaskLeadProfileModelConfig(
     }
 
     const model = modelValue.trim();
-
-    if (!model.includes("/")) {
+    const parsed = parseModelReference(model);
+    if (!parsed) {
       skipped.push({ profile: profileName, reason: "model must use provider/model format" });
       continue;
     }
@@ -667,7 +681,7 @@ export function applyTaskLeadProfileModelConfig(
       continue;
     }
 
-    if (availableModels.size > 0 && !availableModels.has(model)) {
+    if (availableModels.size > 0 && !availableModels.has(model) && !availableModels.has(parsed.baseId)) {
       if (!options.allowUnavailableModels) {
         skipped.push({ profile: profileName, reason: "model is not in the imported model pool" });
         continue;
@@ -697,7 +711,9 @@ export function applyRoleReasoningEffortConfig(
   config: Record<string, unknown>,
   assignments: Record<string, unknown>,
 ): ApplyRoleReasoningEffortConfigResult {
-  const agents = ensureRecord(config, "agent");
+  // Same effective container rule as applyRoleModelConfig.
+  const useNativeAgentContainer = isRecord(config["agents"]);
+  const agents = ensureRecord(config, useNativeAgentContainer ? "agents" : "agent");
   const validRoles = new Set<string>(CONFIGURABLE_ROLE_NAMES);
   const changed: ApplyRoleReasoningEffortConfigResult["changed"] = [];
   const skipped: ApplyRoleReasoningEffortConfigResult["skipped"] = [];
@@ -1060,8 +1076,14 @@ function readModelMetadata(modelValue: unknown): Partial<ProviderModel> {
 }
 
 function readVariantNames(value: unknown): string[] {
-  if (!isRecord(value)) return [];
-  return Object.keys(value).sort((left, right) => left.localeCompare(right));
+  if (isRecord(value)) return Object.keys(value).sort((left, right) => left.localeCompare(right));
+  // Native v2 variants are an ordered array of entries with `id`.
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => isRecord(entry) && typeof entry["id"] === "string" ? entry["id"] : undefined)
+      .filter((entry): entry is string => Boolean(entry));
+  }
+  return [];
 }
 
 function readReasoningEffort(agent: Record<string, unknown>): ReasoningEffort | undefined {

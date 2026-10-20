@@ -1,5 +1,12 @@
 import { ROLE_CONTRACTS, type RoleName } from "../contracts.js";
 import {
+  legacyAgentEntries,
+  managedPluginOptions,
+  mergedAgentEntries,
+  nativeAgentEntries,
+  parseModelReference,
+} from "../compat/config.js";
+import {
   normalizeSpecialistConfig,
   type SpecialistAgentConfig,
 } from "./specialist-registry.js";
@@ -46,6 +53,31 @@ export interface ApplyLiteTaskLeadProfileModelConfigResult {
 export interface ApplyLiteTaskLeadProfileReasoningConfigResult {
   changed: Array<{ profile: string; previous?: LiteReasoningEffort; next: LiteReasoningEffort; requested?: string }>;
   skipped: Array<{ profile: string; reason: string }>;
+}
+
+/** Which config surfaces an agent preference belongs to. */
+export type AgentPreferenceKind = "role" | "task-lead-profile" | "specialist";
+
+/**
+ * Normalized stored preference shape consumed by the C05 v2 request-hook work.
+ * All values come from oh-my-lite-openagent.json ("stored"); a stored value is
+ * never a runtime-effectiveness guarantee. When the stored model carries an
+ * explicit `#variant`, the selected variant takes precedence over any stored
+ * reasoning effort, recorded here as `reasoningConflict`.
+ */
+export interface AgentModelPreference {
+  agentId: string;
+  kind: AgentPreferenceKind;
+  /** Full stored model reference, including an explicit variant when present. */
+  storedModel?: string;
+  /** Parsed provider/model base of the stored reference. */
+  baseModel?: string;
+  /** Explicit `#variant` parsed from the stored reference. */
+  selectedVariant?: string;
+  /** Requested reasoning effort persisted through apply. */
+  storedReasoningEffort?: LiteReasoningEffort;
+  /** True when an explicit model variant takes precedence over storedReasoningEffort. */
+  reasoningConflict: boolean;
 }
 
 export const DEFAULT_ROLE_REASONING_EFFORT: Readonly<Record<RoleName, LiteReasoningEffort>> = {
@@ -141,22 +173,30 @@ export function migrateLiteConfigFromOpenCodeConfig(
     roleReasoningEffort: {},
     taskLeadProfiles: {},
   };
-  const agents = isRecord(config["agent"]) ? config["agent"] : {};
+  // Effective entries: mixed configs read native `agents` over legacy `agent`
+  // per name; each entry may be legacy- or native-shaped but never both.
+  const agents = mergedAgentEntries(config);
 
   for (const role of ROLE_CONTRACTS) {
     const rawAgent = agents[role.name];
-    const agent: Record<string, unknown> = isRecord(rawAgent) ? rawAgent : {};
-    const model = typeof agent["model"] === "string" && agent["model"].includes("/")
-      ? agent["model"]
-      : undefined;
-    const effort = normalizeLiteReasoningEffort(agent["reasoningEffort"])
-      ?? (isRecord(agent["options"]) ? normalizeLiteReasoningEffort(agent["options"]["reasoningEffort"]) : undefined);
+    if (!isRecord(rawAgent)) continue;
+    if (rawAgent["disable"] === true || rawAgent["disabled"] === true) continue;
+    // Parse the reference fully; explicit `#variant` is preserved, never discarded.
+    const parsed = parseModelReference(rawAgent["model"]);
+    const model = parsed ? parsed.reference : undefined;
+    const effort = normalizeLiteReasoningEffort(rawAgent["reasoningEffort"])
+      ?? (isRecord(rawAgent["options"]) ? normalizeLiteReasoningEffort(rawAgent["options"]["reasoningEffort"]) : undefined);
     if (model && !existing.roleModels[role.name]) patch.roleModels![role.name] = model;
     if (effort && !existing.roleReasoningEffort[role.name]) patch.roleReasoningEffort![role.name] = effort;
   }
 
-  const legacyProfiles = isRecord(config["taskLeadProfiles"]) ? config["taskLeadProfiles"] : {};
-  for (const [profileName, rawProfile] of Object.entries(legacyProfiles)) {
+  // Profile preferences: managed plugin options are the effective source when
+  // present; otherwise the (legacy) top-level `taskLeadProfiles` map.
+  const pluginOptions = managedPluginOptions(config);
+  const profileSource = isRecord(pluginOptions["taskLeadProfiles"])
+    ? pluginOptions["taskLeadProfiles"]
+    : (isRecord(config["taskLeadProfiles"]) ? config["taskLeadProfiles"] : {});
+  for (const [profileName, rawProfile] of Object.entries(profileSource)) {
     if (!isKnownTaskLeadProfile(profileName) || !isRecord(rawProfile)) continue;
     const currentProfile = existing.taskLeadProfiles[profileName] ?? {};
     const nextProfile: LiteTaskLeadProfileConfig = { ...currentProfile };
@@ -178,20 +218,31 @@ export function withLiteConfigAppliedToOpenCodeConfig(
   config: Record<string, unknown>,
   liteConfig: LiteOpenAgentConfig,
 ): Record<string, unknown> {
+  const legacyAgents = legacyAgentEntries(config);
+  const nativeAgents = nativeAgentEntries(config);
   const effective: Record<string, unknown> = {
     ...config,
-    agent: {
-      ...(isRecord(config["agent"]) ? config["agent"] : {}),
-    },
     taskLeadProfiles: {
       ...(isRecord(config["taskLeadProfiles"]) ? config["taskLeadProfiles"] : {}),
     },
   };
-  const agents = effective["agent"] as Record<string, unknown>;
-  const profiles = effective["taskLeadProfiles"] as Record<string, unknown>;
+
+  // Project role preferences into the effective container. Mixed configs keep
+  // native `agents` entries as native (never adding legacy fields inside
+  // native entries); values never cross containers.
+  if (legacyAgents) effective["agent"] = { ...legacyAgents };
+  if (nativeAgents) effective["agents"] = { ...nativeAgents };
+  if (!legacyAgents && !nativeAgents) effective["agent"] = {};
 
   for (const role of ROLE_CONTRACTS) {
-    const rawAgent = agents[role.name];
+    // Managed updates always target the effective native container when one
+    // exists (mixed configs must not write shadowed legacy fields); only
+    // legacy-classified configs keep writing the v1 `agent` map.
+    const source = legacyAgents && !nativeAgents
+      ? (effective["agent"] as Record<string, unknown>)
+      : (effective["agents"] as Record<string, unknown>);
+    if (!source) continue;
+    const rawAgent = source[role.name];
     const agent: Record<string, unknown> = isRecord(rawAgent) ? { ...rawAgent } : {};
     const model = liteConfig.roleModels[role.name];
     const effort = liteConfig.roleReasoningEffort[role.name];
@@ -199,10 +250,11 @@ export function withLiteConfigAppliedToOpenCodeConfig(
       ?? (isRecord(agent["options"]) ? normalizeLiteReasoningEffort(agent["options"]["reasoningEffort"]) : undefined);
     if (model) agent["model"] = model;
     if (effort && !currentEffort) agent["reasoningEffort"] = effort;
-    agents[role.name] = agent;
+    source[role.name] = agent;
   }
 
   for (const profile of DEFAULT_TASK_LEAD_PROFILES) {
+    const profiles = effective["taskLeadProfiles"] as Record<string, unknown>;
     const rawProfile = profiles[profile.name];
     const current: Record<string, unknown> = isRecord(rawProfile) ? { ...rawProfile } : {};
     const configured = liteConfig.taskLeadProfiles[profile.name];
@@ -288,15 +340,18 @@ export function applyLiteRoleModelConfig(
       continue;
     }
     const model = modelValue.trim();
-    if (!model.includes("/")) {
+    const parsed = parseModelReference(model);
+    if (!parsed) {
       skipped.push({ role, reason: "model must use provider/model format" });
       continue;
     }
+    // The explicit variant is stored with the assignment; the base model is
+    // validated separately against the imported pool.
     if (availableModels.size === 0 && !options.allowUnavailableModels) {
       skipped.push({ role, reason: "no imported model pool is available" });
       continue;
     }
-    if (availableModels.size > 0 && !availableModels.has(model)) {
+    if (availableModels.size > 0 && !availableModels.has(model) && !availableModels.has(parsed.baseId)) {
       if (!options.allowUnavailableModels) {
         skipped.push({ role, reason: "model is not in the imported model pool" });
         continue;
@@ -361,7 +416,8 @@ export function applyLiteTaskLeadProfileModelConfig(
       continue;
     }
     const model = modelValue.trim();
-    if (!model.includes("/")) {
+    const parsed = parseModelReference(model);
+    if (!parsed) {
       skipped.push({ profile: profileName, reason: "model must use provider/model format" });
       continue;
     }
@@ -369,7 +425,7 @@ export function applyLiteTaskLeadProfileModelConfig(
       skipped.push({ profile: profileName, reason: "no imported model pool is available" });
       continue;
     }
-    if (availableModels.size > 0 && !availableModels.has(model)) {
+    if (availableModels.size > 0 && !availableModels.has(model) && !availableModels.has(parsed.baseId)) {
       if (!options.allowUnavailableModels) {
         skipped.push({ profile: profileName, reason: "model is not in the imported model pool" });
         continue;
@@ -406,6 +462,55 @@ export function applyLiteTaskLeadProfileReasoningEffortConfig(
   }
 
   return { changed, skipped };
+}
+
+/**
+ * Normalizes stored model/reasoning preferences for the C05 v2 request-hook
+ * work. Distinguishes the stored reference (with any explicit variant) from
+ * the stored requested reasoning effort; an explicit variant always takes
+ * precedence over a conflicting stored effort. Returned values describe what
+ * is persisted, not what is runtime-effective.
+ */
+export function listAgentModelPreferences(liteConfig: LiteOpenAgentConfig): AgentModelPreference[] {
+  const preferences: AgentModelPreference[] = [];
+
+  const pushPreference = (
+    agentId: string,
+    kind: AgentPreferenceKind,
+    storedModel: string | undefined,
+    storedReasoningEffort: LiteReasoningEffort | undefined,
+  ): void => {
+    const parsed = storedModel ? parseModelReference(storedModel) : undefined;
+    preferences.push({
+      agentId,
+      kind,
+      ...(storedModel ? { storedModel } : {}),
+      ...(parsed ? { baseModel: parsed.baseId } : {}),
+      ...(parsed?.variant ? { selectedVariant: parsed.variant } : {}),
+      ...(storedReasoningEffort ? { storedReasoningEffort } : {}),
+      reasoningConflict: Boolean(parsed?.variant && storedReasoningEffort),
+    });
+  };
+
+  for (const [role, storedModel] of Object.entries(liteConfig.roleModels)) {
+    pushPreference(role, "role", storedModel, liteConfig.roleReasoningEffort[role as RoleName]);
+  }
+  for (const role of ROLE_CONTRACTS) {
+    if (liteConfig.roleModels[role.name]) continue;
+    const effort = liteConfig.roleReasoningEffort[role.name];
+    if (!effort) continue;
+    pushPreference(role.name, "role", undefined, effort);
+  }
+  // Roles without any stored preference are omitted entirely.
+
+  for (const [profileName, profile] of Object.entries(liteConfig.taskLeadProfiles)) {
+    pushPreference(profileName, "task-lead-profile", profile.model, profile.reasoningEffort);
+  }
+  for (const [specialistName, specialist] of Object.entries(liteConfig.specialists ?? {})) {
+    pushPreference(specialistName, "specialist", specialist.model, specialist.reasoningEffort);
+  }
+
+  return preferences;
 }
 
 function supportedReasoningEfforts(model?: ProviderModel | string): LiteReasoningEffort[] {

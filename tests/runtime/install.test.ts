@@ -38,21 +38,25 @@ describe("global installer contract", () => {
     expect(installScript).toContain("const MANAGED_MCP_NAMES = new Set");
     expect(installScript).toContain('"context7"');
     expect(installScript).toContain('"playwright"');
-    expect(installScript).toContain("function mergeMcp(existingMcp, sourceMcp, managedMcp = true)");
+    expect(installScript).toContain(
+      "function mergeMcpDialectAware(existingConfig, sourceConfig, managedMcp = true, isNativeTarget = false)",
+    );
     expect(installScript).toContain("MANAGED_MCP_NAMES.has(serverName)");
     expect(installScript).toContain("--no-managed-mcp");
   });
 
   it("writes the target configDir into the managed plugin options", () => {
-    expect(installScript).toContain("function relativePluginSpec(configDir, taskLeadProfiles)");
+    expect(installScript).toContain("function relativePluginOptions(configDir, taskLeadProfiles)");
     expect(installScript).toContain("configDir,");
-    expect(installScript).toContain("relativePluginSpec(configDir, taskLeadProfiles)");
+    expect(installScript).toContain(
+      "upsertManagedPluginEntry(pluginContainers, MANAGED_PLUGIN_SPECS[0], relativePluginOptions(configDir, taskLeadProfiles))",
+    );
   });
 
   it("migrates legacy top-level Task Lead profiles into plugin options", () => {
-    expect(installScript).toContain("existingConfig.taskLeadProfiles");
-    expect(installScript).toContain("managedPluginOptions.taskLeadProfiles");
-    expect(installScript).toContain("existingWithoutLegacyProfiles");
+    expect(installScript).toContain("pluginProfiles.taskLeadProfiles");
+    expect(installScript).toContain("existingOpenCodeConfig.taskLeadProfiles");
+    expect(installScript).toContain("taskLeadProfiles: _legacyTaskLeadProfiles");
     expect(installScript).toContain("taskLeadProfiles } : {})");
   });
 

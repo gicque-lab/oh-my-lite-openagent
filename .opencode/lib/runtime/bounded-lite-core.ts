@@ -43,12 +43,14 @@ import {
   applyLiteTaskLeadProfileModelConfig,
   applyLiteTaskLeadProfileReasoningEffortConfig,
   createDefaultLiteConfig,
+  listAgentModelPreferences,
   LITE_CONFIG_FILE,
   migrateLiteConfigFromOpenCodeConfig,
   readLiteConfig,
   type LiteOpenAgentConfig,
   withLiteConfigAppliedToOpenCodeConfig,
 } from "./lite-config.js";
+import { mergedAgentEntries } from "../compat/config.js";
 import { access, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import os from "node:os";
@@ -57,8 +59,8 @@ import { inflateRawSync } from "node:zlib";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { z } from "zod";
+import { managedPluginOptions } from "../compat/config.js";
 
-const PLUGIN_FILE = "bounded-lite.ts";
 const STUDY_SUPPORTED_EXTENSIONS = new Set([".ppt", ".pptx", ".pdf"]);
 const STUDY_GENERATED_FILES = new Set([
   "AGENTS.md",
@@ -886,24 +888,14 @@ async function resolveOpenCodeConfigPath(configDir?: string): Promise<string> {
   return jsonPath;
 }
 
-function isBoundedLitePluginSpec(spec: unknown): boolean {
-  const value = Array.isArray(spec) ? spec[0] : spec;
-  return typeof value === "string" && value.includes(PLUGIN_FILE);
-}
-
+/**
+ * Effective managed plugin options, read through the dialect-aware format
+ * boundary: exactly known managed specs in both the legacy `plugin` and the
+ * native `plugins` containers; native options win on mixed files and folder
+ * paths that merely contain "bounded-lite.ts" are never classified as managed.
+ */
 function readBoundedLitePluginOptions(config: Record<string, unknown>): Record<string, unknown> {
-  const rawPlugins = Array.isArray(config["plugin"])
-    ? config["plugin"]
-    : config["plugin"]
-      ? [config["plugin"]]
-      : [];
-
-  for (const spec of rawPlugins) {
-    if (!isBoundedLitePluginSpec(spec)) continue;
-    if (Array.isArray(spec) && isRecord(spec[1])) return spec[1];
-  }
-
-  return {};
+  return managedPluginOptions(config);
 }
 
 function configuredTaskLeadProfiles(
@@ -926,44 +918,51 @@ function withConfiguredTaskLeadProfiles(
   };
 }
 
-function updateBoundedLitePluginOptions(
-  config: Record<string, unknown>,
-  updater: (pluginOptions: Record<string, unknown>) => Record<string, unknown>,
-): void {
-  const rawPlugins = Array.isArray(config["plugin"])
-    ? config["plugin"]
-    : config["plugin"]
-      ? [config["plugin"]]
-      : [];
-  let updated = false;
+/**
+ * Distinguishes stored / selected / effective values in the tool report.
+ * Values come from oh-my-lite-openagent.json and describe what was persisted;
+ * explicit per-agent opencode.json model entries (either dialect) shadow the
+ * stored model and are reported instead of being overwritten covertly.
+ */
+function formatStoredPreferenceSection(
+  rawConfig: Record<string, unknown>,
+  liteConfig: LiteOpenAgentConfig,
+): string[] {
+  const preferences = listAgentModelPreferences(liteConfig);
+  if (preferences.length === 0) return [];
+  const agents = mergedAgentEntries(rawConfig);
 
-  const plugins = rawPlugins.map((spec) => {
-    if (!isBoundedLitePluginSpec(spec)) return spec;
+  const fileModelForAgent = (agentId: string): string | undefined => {
+    const entry = agents[agentId];
+    return isRecord(entry) && typeof entry["model"] === "string" ? entry["model"] : undefined;
+  };
 
-    if (Array.isArray(spec)) {
-      const next = [...spec];
-      const existingOptions = isRecord(spec[1]) ? spec[1] : {};
-      next[1] = updater(existingOptions);
-      updated = true;
-      return next;
+  const lines = [
+    "Stored preferences (from oh-my-lite-openagent.json; stored values are not a runtime-effectiveness guarantee):",
+  ];
+  const conflicts: string[] = [];
+
+  for (const preference of preferences) {
+    const parts: string[] = [];
+    if (preference.storedModel) parts.push(`stored model=${preference.storedModel}`);
+    if (preference.selectedVariant) parts.push(`explicit variant selected=${preference.selectedVariant}`);
+    if (preference.storedReasoningEffort) {
+      parts.push(preference.reasoningConflict
+        ? `stored reasoningEffort=${preference.storedReasoningEffort} skipped (explicit variant wins)`
+        : `requested reasoningEffort=${preference.storedReasoningEffort}`);
     }
+    if (parts.length > 0) lines.push(`- ${preference.kind} "${preference.agentId}": ${parts.join("; ")}`);
 
-    updated = true;
-    return [spec, updater({})];
-  });
+    if (preference.kind !== "role") continue;
+    const fileModel = fileModelForAgent(preference.agentId);
+    if (fileModel && fileModel !== preference.storedModel) {
+      conflicts.push(
+        `- role "${preference.agentId}": explicit opencode.json model "${fileModel}" shadows the stored preference "${preference.storedModel ?? "<unset>"}"; update that config entry or remove it for the stored choice to apply.`,
+      );
+    }
+  }
 
-  if (updated) config["plugin"] = plugins;
-}
-
-function writeTaskLeadProfilesToPluginOptions(
-  config: Record<string, unknown>,
-  taskLeadProfiles: Record<string, unknown>,
-): void {
-  updateBoundedLitePluginOptions(config, (pluginOptions) => ({
-    ...pluginOptions,
-    taskLeadProfiles,
-  }));
-  delete config["taskLeadProfiles"];
+  return [...lines, ...conflicts];
 }
 
 function taskLeadProfilesToDispatch(
@@ -1906,6 +1905,10 @@ If no provider models are found, tell the user to configure or connect OpenCode 
                   ...profileReasoningResult.skipped.map((item) => `- ${item.profile}: ${item.reason}`),
                 ]
                 : []),
+              ...(() => {
+                const storedPreferenceLines = formatStoredPreferenceSection(config, liteConfig);
+                return storedPreferenceLines.length > 0 ? ["", ...storedPreferenceLines] : [];
+              })(),
               "",
               `Updated ${liteConfigPath}.`,
               `Updated agent markdown files: ${updatedAgents.length > 0 ? updatedAgents.join(", ") : "none"}.`,

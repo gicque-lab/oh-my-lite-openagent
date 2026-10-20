@@ -1,0 +1,11 @@
+{
+  // Native hidden/disabled agent overrides: user-authored native entries for
+  // managed roles and built-in overrides. The installer must stop the write.
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [{ "package": "./.opencode/plugins/bounded-lite.ts", "options": { "configDir": "/tmp/cfg" } }],
+  "agents": {
+    "command-lead": { "system": "User's own orchestrator definition.", "hidden": true },
+    "build": { "disabled": true },
+    "custom-native": { "system": "Custom native agent." }
+  }
+}

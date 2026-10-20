@@ -1,0 +1,42 @@
+{
+  // Native v2 configuration fixture (JSONC comments must parse).
+  "$schema": "https://opencode.ai/config.json",
+  "model": "anthropic/claude-sonnet-4-6#high",
+  "default_agent": "command-lead",
+  "plugins": [
+    "./native-third-party.ts",
+    {
+      "package": "./.opencode/plugins/bounded-lite.ts",
+      "options": { "mode": "full", "configDir": "/tmp/cfg-native" }
+    },
+    "-/removed/third-party.ts"
+  ],
+  "agents": {
+    "custom-native": { "system": "Custom native agent.", "model": "opencode-go/glm-5" },
+    "disabled-helper": { "system": "Disabled helper.", "disabled": true }
+  },
+  "commands": {
+    "customNativeCmd": { "template": "native custom command" }
+  },
+  "permissions": [
+    { "action": "edit", "resource": "*.env", "effect": "ask" },
+    { "action": "shell", "resource": "git push", "effect": "ask" }
+  ],
+  "providers": {
+    "anthropic": {
+      "package": "aisdk:@ai-sdk/anthropic",
+      "settings": { "apiKey": "{env:TEST_NATIVE_KEY}" },
+      "models": {
+        "claude-sonnet-4-6": {
+          "name": "Claude Sonnet",
+          "variants": [ { "id": "high" }, { "id": "low" } ]
+        }
+      }
+    }
+  },
+  "mcp": {
+    "servers": {
+      "context7": { "type": "local", "command": ["native", "context7"] }
+    }
+  }
+}
