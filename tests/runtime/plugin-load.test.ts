@@ -1,10 +1,30 @@
 import { createBoundedLitePlugin } from "../../.opencode/plugins/bounded-lite.js";
+import { createBoundedLiteCore } from "../../.opencode/lib/runtime/bounded-lite-core.js";
 import { tool } from "@opencode-ai/plugin";
 import { z } from "zod";
 import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { ToolContext } from "@opencode-ai/plugin";
+
+/**
+ * Realistic v1 ToolContext: deterministic identity fields, directory/worktree
+ * from the test fixture, and no client (v1 ToolContext has no client field).
+ */
+function tctx(ctx: { directory?: string; worktree?: string; ask?: ToolContext["ask"] } = {}): ToolContext {
+  const directory = ctx.directory ?? process.cwd();
+  return {
+    sessionID: "ses-test",
+    messageID: "msg-test",
+    agent: "task-lead",
+    directory,
+    worktree: ctx.worktree ?? directory,
+    abort: new AbortController().signal,
+    metadata: () => {},
+    ask: ctx.ask ?? (() => Promise.resolve()),
+  };
+}
 
 async function pathExists(filePath: string): Promise<boolean> {
   try {
@@ -229,25 +249,19 @@ describe("plugin safety", () => {
 
     const routeResult = hooks.tool?.bounded_lite_route?.execute(
       { category: "execution" },
-      { directory: process.cwd() },
+      tctx({ directory: process.cwd() }),
     );
     const backgroundResult = hooks.tool?.bounded_lite_background?.execute(
       {},
-      { directory: process.cwd() },
+      tctx({ directory: process.cwd() }),
     );
     const runtimeProfileResult = hooks.tool?.bounded_lite_runtime_profile?.execute(
       {},
-      { directory: process.cwd() },
+      tctx({ directory: process.cwd() }),
     );
-    const permissionResult = hooks["permission.ask"]?.(
-      { tool: "bounded_lite_route", action: "execute" },
-      { status: "deny" },
-    );
-
     expect(routeResult).toBeInstanceOf(Promise);
     expect(backgroundResult).toBeInstanceOf(Promise);
     expect(runtimeProfileResult).toBeInstanceOf(Promise);
-    expect(permissionResult).toBeInstanceOf(Promise);
     const routeOutput = await routeResult;
     const backgroundOutput = await backgroundResult;
     const runtimeProfileOutput = await runtimeProfileResult;
@@ -263,27 +277,190 @@ describe("plugin safety", () => {
     });
   });
 
-  it("allows bounded lite plugin tools without extra permission prompts", async () => {
-    const hooks = await Promise.resolve(
-      createBoundedLitePlugin({
-        directory: process.cwd(),
-      }),
-    );
-    const modelOutput: { status: "allow" | "ask" | "deny" } = { status: "deny" };
-    const planOutput: { status: "allow" | "ask" | "deny" } = { status: "deny" };
+  it("validates maxChildDepth at factory setup before any hooks exist", async () => {
+    for (const bad of [-1, -0.5, Number.NaN, Number.POSITIVE_INFINITY, 2, 99]) {
+      await expect(
+        createBoundedLitePlugin({ directory: process.cwd() }, { maxChildDepth: bad }),
+      ).rejects.toThrow(/maxChildDepth/);
+    }
 
-    await hooks["permission.ask"]?.(
-      { tool: "bounded_lite_model_config", action: "execute" },
-      modelOutput,
-    );
-    await hooks["permission.ask"]?.(
-      { tool: "bounded_lite_plan_artifact", action: "execute" },
-      planOutput,
-    );
-
-    expect(modelOutput.status).toBe("allow");
-    expect(planOutput.status).toBe("allow");
+    for (const good of [0, 1]) {
+      const hooks = await createBoundedLitePlugin({ directory: process.cwd() }, { maxChildDepth: good });
+      expect(Object.keys(hooks.tool ?? {})).toHaveLength(9);
+    }
   });
+
+  it("resolves plan artifact roots from the invocation worktree, not process.cwd", async () => {
+    const worktreeA = await mkdtemp(path.join(os.tmpdir(), "omo-lite-wt-a-"));
+    const worktreeB = await mkdtemp(path.join(os.tmpdir(), "omo-lite-wt-b-"));
+    try {
+      const hooks = await createBoundedLitePlugin({ directory: worktreeA });
+      await hooks.tool?.bounded_lite_plan_artifact?.execute(
+        { title: "Second Worktree", markdown: "# in B" },
+        tctx({ directory: worktreeB, worktree: worktreeA }),
+      );
+      const plansA = await readdir(path.join(worktreeA, ".liteagent", "plans"));
+      await expect(access(path.join(worktreeB, ".liteagent"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(plansA).toHaveLength(1);
+    } finally {
+      await rm(worktreeA, { recursive: true, force: true });
+      await rm(worktreeB, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed for plan artifact and study tools on missing invocation location", async () => {
+    const core = await createBoundedLiteCore({});
+    await expect(core.tool.bounded_lite_plan_artifact?.execute({ title: "x", markdown: "# x" }, {}))
+      .rejects.toThrow(/no worktree or directory/);
+    await expect(core.tool.bounded_lite_study_ingest?.execute({}, {}))
+      .rejects.toThrow(/no directory or worktree/);
+    await expect(core.tool.bounded_lite_study_package?.execute({}, {}))
+      .rejects.toThrow(/no directory or worktree/);
+  });
+
+  it("supports nested study directories and worktree-scoped study input", async () => {
+    const base = await mkdtemp(path.join(os.tmpdir(), "omo-lite-study-nested-"));
+    const nested = path.join(base, "nested", "inner");
+    const worktree = await mkdtemp(path.join(os.tmpdir(), "omo-lite-study-wt-"));
+    try {
+      await mkdir(nested, { recursive: true });
+      await writeFile(path.join(nested, "05-nested.pdf"), "%PDF-1.4\n1 0 obj << /Type /Page >> endobj\nBT (Chapter 5 Nested Directory) Tj ET\n%%EOF\n");
+      await writeFile(path.join(worktree, "06-worktree.pdf"), "%PDF-1.4\n1 0 obj << /Type /Page >> endobj\nBT (Chapter 6 Worktree) Tj ET\n%%EOF\n");
+
+      const hooks = await createBoundedLitePlugin({ directory: base });
+
+      // Nested relative directory inside the invocation directory: no external flag needed.
+      const nestedOutput = await hooks.tool?.bounded_lite_study_ingest?.execute(
+        { directory: "nested/inner" },
+        tctx({ directory: base, worktree }),
+      );
+      expect(JSON.parse(String(nestedOutput))).toMatchObject({ discoveredFiles: ["05-nested.pdf"] });
+
+      // Study input uses the invocation directory, not the worktree.
+      const directoryOutput = await hooks.tool?.bounded_lite_study_ingest?.execute(
+        {},
+        tctx({ directory: base, worktree: worktree }),
+      );
+      expect(JSON.parse(String(directoryOutput))).toMatchObject({ discoveredFiles: [] });
+
+      const worktreeOutput = await hooks.tool?.bounded_lite_study_ingest?.execute(
+        {},
+        tctx({ directory: worktree, worktree: worktree }),
+      );
+      expect(JSON.parse(String(worktreeOutput))).toMatchObject({ discoveredFiles: ["06-worktree.pdf"] });
+    } finally {
+      await rm(base, { recursive: true, force: true });
+      await rm(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it("no longer carries a prefix-based permission auto-allow or no-op execute hooks", async () => {
+    const hooks = await createBoundedLitePlugin({
+      directory: process.cwd(),
+    });
+
+    const v1Hooks = hooks as unknown as Record<string, unknown>;
+    expect(v1Hooks["permission.ask"]).toBeUndefined();
+    expect(v1Hooks["tool.execute.before"]).toBeUndefined();
+    expect(v1Hooks["tool.execute.after"]).toBeUndefined();
+  });
+
+  it("uses the host ask channel on mutation paths and respects deny", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "omo-lite-mutation-"));
+    try {
+      const hooks = await createBoundedLitePlugin({ directory: root });
+      const seen: Array<{ permission: string; patterns: string[] }> = [];
+      const t = hooks.tool!.bounded_lite_plan_artifact!;
+
+      // Deny (ask throws like a real host denial) -> write fails, nothing written.
+      await expect(t.execute(
+        { title: "Denied Write", markdown: "# x" },
+        tctx({
+          directory: root,
+          ask: async (input) => {
+            seen.push({ permission: input.permission, patterns: [...input.patterns] });
+            throw new Error("denied by host");
+          },
+        }),
+      )).rejects.toThrow("denied by host");
+      expect(await readdir(root)).toEqual([]);
+
+      // Allowed -> write proceeds with the asserted patterns.
+      await t.execute({ title: "Allowed Write", markdown: "# x" }, tctx({
+        directory: root,
+        ask: async (input) => {
+          seen.push({ permission: input.permission, patterns: [...input.patterns] });
+        },
+      }));
+      expect(seen.length).toBe(2);
+      expect(seen[1]).toMatchObject({ permission: "bounded-lite-mutation", patterns: [".liteagent/plans"] });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("discovers runtime models from the captured initialization client without any client in ToolContext", async () => {
+    const configDir = await mkdtemp(path.join(os.tmpdir(), "omo-lite-init-client-"));
+    try {
+      await writeFile(path.join(configDir, "opencode.json"), `${JSON.stringify({ agent: {} })}
+`);
+      const hooks = await createBoundedLitePlugin(
+        {
+          directory: process.cwd(),
+          client: {
+            config: {
+              providers: async () => ({
+                data: {
+                  providers: [
+                    {
+                      id: "opencode-ai",
+                      models: {
+                        "fix-probe-model": { id: "fix-probe-model", name: "Fix Probe" },
+                      },
+                    },
+                  ],
+                },
+              }),
+            },
+          },
+        },
+        { configDir },
+      );
+      const output = await hooks.tool?.bounded_lite_model_config?.execute(
+        { action: "list" },
+        tctx({ directory: process.cwd() }),
+      );
+      expect(String(output)).toContain("opencode-ai/fix-probe-model");
+    } finally {
+      await rm(configDir, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores a client artifact planted in the tool execution context (never read)", async () => {
+    const configDir = await mkdtemp(path.join(os.tmpdir(), "omo-lite-no-ctx-client-"));
+    try {
+      await writeFile(path.join(configDir, "opencode.json"), `${JSON.stringify({ agent: {} })}
+`);
+      const hooks = await createBoundedLitePlugin(
+        { directory: process.cwd(), client: undefined },
+        { configDir },
+      );
+      const output = await hooks.tool?.bounded_lite_model_config?.execute(
+        { action: "list" },
+        {
+          ...tctx({ directory: process.cwd() }),
+          // A malformed/hostile context claiming to carry a client must be inert.
+          client: {
+            config: { providers: async () => ({ data: { providers: [{ id: "evil", models: { "evil/model": {} } }] } }) },
+          },
+        } as unknown as ToolContext,
+      );
+      expect(String(output)).not.toContain("evil/model");
+    } finally {
+      await rm(configDir, { recursive: true, force: true });
+    }
+  });
+
 
   it("shows the imported model pool before auto recommendations", async () => {
     const configDir = await mkdtemp(path.join(os.tmpdir(), "omo-lite-models-"));
@@ -292,11 +469,6 @@ describe("plugin safety", () => {
       await writeFile(path.join(configDir, "opencode.json"), `${JSON.stringify({ agent: {} })}\n`);
 
       const hooks = await createBoundedLitePlugin(
-        { directory: process.cwd() },
-        { configDir },
-      );
-      const output = await hooks.tool?.bounded_lite_model_config?.execute(
-        { action: "auto" },
         {
           directory: process.cwd(),
           client: {
@@ -317,6 +489,11 @@ describe("plugin safety", () => {
             },
           },
         },
+        { configDir },
+      );
+      const output = await hooks.tool?.bounded_lite_model_config?.execute(
+        { action: "auto" },
+        tctx(tctx({ directory: process.cwd() })),
       );
 
       expect(String(output)).toContain("Available imported model pool (review before recommendations):");
@@ -345,7 +522,7 @@ describe("plugin safety", () => {
       const agentsDir = path.join(configDir, "agents");
 
       const hooks = await createBoundedLitePlugin(
-        { directory: process.cwd() },
+        tctx({ directory: process.cwd() }),
         { configDir },
       );
       const output = await hooks.tool?.bounded_lite_model_config?.execute(
@@ -355,10 +532,7 @@ describe("plugin safety", () => {
           reasoningEffortAssignments: { "command-lead": "max" },
           allowUnavailableModels: true,
         },
-        {
-          directory: process.cwd(),
-          client: {},
-        },
+        tctx({ directory: process.cwd() }),
       );
       const writtenConfigText = await readFile(jsoncPath, "utf8");
       const liteConfigPath = path.join(configDir, "oh-my-lite-openagent.json");
@@ -392,7 +566,7 @@ describe("plugin safety", () => {
       );
 
       const hooks = await createBoundedLitePlugin(
-        { directory: process.cwd() },
+        tctx({ directory: process.cwd() }),
         { configDir },
       );
       const output = await hooks.tool?.bounded_lite_model_config?.execute(
@@ -401,10 +575,7 @@ describe("plugin safety", () => {
           assignments: { "command-lead": "openai/gpt-5.4" },
           allowUnavailableModels: true,
         },
-        {
-          directory: process.cwd(),
-          client: {},
-        },
+        tctx({ directory: process.cwd() }),
       );
 
       const generatedAgent = await readFile(path.join(agentsDir, "command-lead.md"), "utf8");
@@ -440,7 +611,7 @@ describe("plugin safety", () => {
       );
 
       const hooks = await createBoundedLitePlugin(
-        { directory: process.cwd() },
+        tctx({ directory: process.cwd() }),
         { configDir },
       );
       const output = await hooks.tool?.bounded_lite_model_config?.execute(
@@ -449,10 +620,7 @@ describe("plugin safety", () => {
           assignments: { "command-lead": "openai/gpt-5.4" },
           allowUnavailableModels: true,
         },
-        {
-          directory: process.cwd(),
-          client: {},
-        },
+        tctx({ directory: process.cwd() }),
       );
 
       const generatedAgent = await readFile(path.join(agentsDir, "command-lead.md"), "utf8");
@@ -492,7 +660,7 @@ describe("plugin safety", () => {
       );
 
       const hooks = await createBoundedLitePlugin(
-        { directory: process.cwd() },
+        tctx({ directory: process.cwd() }),
         { configDir },
       );
       const output = await hooks.tool?.bounded_lite_model_config?.execute(
@@ -507,7 +675,7 @@ describe("plugin safety", () => {
           },
           allowUnavailableModels: true,
         },
-        { directory: process.cwd(), client: {} },
+        tctx(tctx({ directory: process.cwd() })),
       );
 
       const specialist = await readFile(path.join(configDir, "agents", "doc-sync.md"), "utf8");
@@ -546,10 +714,10 @@ describe("plugin safety", () => {
       await writeFile(path.join(coursewareDir, "nested", "ignored.pdf"), "BT (Nested) Tj ET\n");
       await mkdir(path.join(coursewareDir, "sources"));
 
-      const hooks = await createBoundedLitePlugin({ directory: coursewareDir });
+      const hooks = await createBoundedLitePlugin(tctx({ directory: coursewareDir }));
       const output = await hooks.tool?.bounded_lite_study_ingest?.execute(
         {},
-        { directory: coursewareDir },
+        tctx({ directory: coursewareDir }),
       );
       const result = JSON.parse(String(output));
 
@@ -589,10 +757,10 @@ describe("plugin safety", () => {
       process.env.PATH = "";
       await writeFile(path.join(coursewareDir, "legacy.ppt"), "legacy binary placeholder\n");
 
-      const hooks = await createBoundedLitePlugin({ directory: coursewareDir });
+      const hooks = await createBoundedLitePlugin(tctx({ directory: coursewareDir }));
       const output = await hooks.tool?.bounded_lite_study_ingest?.execute(
         {},
-        { directory: coursewareDir },
+        tctx({ directory: coursewareDir }),
       );
       const result = JSON.parse(String(output));
 
@@ -628,10 +796,10 @@ describe("plugin safety", () => {
       );
       await writeFile(path.join(coursewareDir, "AGENTS.md"), "# Course rules\n\nKeep this line.\n");
 
-      const hooks = await createBoundedLitePlugin({ directory: coursewareDir });
+      const hooks = await createBoundedLitePlugin(tctx({ directory: coursewareDir }));
       const output = await hooks.tool?.bounded_lite_study_package?.execute(
         {},
-        { directory: coursewareDir },
+        tctx({ directory: coursewareDir }),
       );
       const result = JSON.parse(String(output));
       const agents = await readFile(path.join(coursewareDir, "AGENTS.md"), "utf8");
@@ -673,10 +841,10 @@ describe("plugin safety", () => {
         "%PDF-1.4\n1 0 obj << /Type /Page >> endobj\nBT (Chapter 4 Transactions covers ACID isolation schedules serializability locking logging recovery checkpoints and final exam practice.) Tj ET\n%%EOF\n",
       );
 
-      const hooks = await createBoundedLitePlugin({ directory: coursewareDir });
+      const hooks = await createBoundedLitePlugin(tctx({ directory: coursewareDir }));
       const output = await hooks.tool?.bounded_lite_study_package?.execute(
         { stage: "sources" },
-        { directory: coursewareDir },
+        tctx({ directory: coursewareDir }),
       );
       const result = JSON.parse(String(output));
 
@@ -702,10 +870,10 @@ describe("plugin safety", () => {
       await writeFile(path.join(coursewareDir, "slides.pdf"), "BT (Chapter 3 Recovery) Tj ET\n");
       await writeFile(path.join(coursewareDir, "AGENTS.md"), "<!-- oh-my-lite-study:start -->\nmissing end\n");
 
-      const hooks = await createBoundedLitePlugin({ directory: coursewareDir });
+      const hooks = await createBoundedLitePlugin(tctx({ directory: coursewareDir }));
       const output = await hooks.tool?.bounded_lite_study_package?.execute(
         {},
-        { directory: coursewareDir },
+        tctx({ directory: coursewareDir }),
       );
       const result = JSON.parse(String(output));
 
@@ -725,16 +893,16 @@ describe("plugin safety", () => {
 
     try {
       await writeFile(path.join(externalDir, "external.pdf"), "BT (External) Tj ET\n");
-      const hooks = await createBoundedLitePlugin({ directory: baseDir });
+      const hooks = await createBoundedLitePlugin(tctx({ directory: baseDir }));
 
       await expect(hooks.tool?.bounded_lite_study_ingest?.execute(
-        { directory: externalDir },
-        { directory: baseDir },
+        tctx({ directory: externalDir }),
+        tctx({ directory: baseDir }),
       )).rejects.toThrow("allowExternalDirectory=true");
 
       const output = await hooks.tool?.bounded_lite_study_ingest?.execute(
         { directory: externalDir, allowExternalDirectory: true },
-        { directory: baseDir },
+        tctx({ directory: baseDir }),
       );
       const result = JSON.parse(String(output));
 
@@ -757,7 +925,7 @@ function serializePlanToolArgs(args: Record<string, unknown>, flavor: "v1" | "v2
 
 describe("plan tool schema projection", () => {
   it("serializes both plan tools' registered args to v1 and v2 JSON Schemas exposing typed payload.plan.subtasks", async () => {
-    const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+    const hooks = await createBoundedLitePlugin(tctx({ directory: process.cwd() }));
     const tools = hooks.tool ?? {};
 
     for (const toolName of ["bounded_lite_plan_dag", "bounded_lite_plan_readiness"] as const) {
@@ -802,7 +970,7 @@ describe("plan tool schema projection", () => {
   });
 
   it("keeps the two intentional no-input tools empty in serialized schemas", async () => {
-    const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+    const hooks = await createBoundedLitePlugin(tctx({ directory: process.cwd() }));
     const tools = hooks.tool ?? {};
 
     for (const toolName of ["bounded_lite_background", "bounded_lite_runtime_profile"] as const) {
@@ -817,12 +985,12 @@ describe("plan tool schema projection", () => {
 
 describe("plan tool handler execution", () => {
   it("executes bounded_lite_plan_dag with the structured fixture and optional dispatch", async () => {
-    const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+    const hooks = await createBoundedLitePlugin(tctx({ directory: process.cwd() }));
     const payload = await loadStructuredPlanFixture();
 
     const output = await hooks.tool?.bounded_lite_plan_dag?.execute(
       { payload, dispatch: { concurrency: 5, attributeProfileMap: { security: "sec-profile" } } },
-      { directory: process.cwd() },
+      tctx({ directory: process.cwd() }),
     );
     const dag = JSON.parse(String(output));
 
@@ -835,30 +1003,30 @@ describe("plan tool handler execution", () => {
   });
 
   it("fails bounded_lite_plan_dag once with an actionable diagnostic for malformed payloads", async () => {
-    const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+    const hooks = await createBoundedLitePlugin(tctx({ directory: process.cwd() }));
     const dagTool = hooks.tool!.bounded_lite_plan_dag!.execute;
 
-    await expect(dagTool({}, { directory: process.cwd() }))
+    await expect(dagTool({}, tctx({ directory: process.cwd() })))
       .rejects.toThrow(/Missing `payload`.*Expected the named `payload` object/s);
-    await expect(dagTool({ payload: null }, { directory: process.cwd() }))
+    await expect(dagTool({ payload: null }, tctx({ directory: process.cwd() })))
       .rejects.toThrow(/is null/);
-    await expect(dagTool({ payload: ["a"] }, { directory: process.cwd() }))
+    await expect(dagTool({ payload: ["a"] }, tctx({ directory: process.cwd() })))
       .rejects.toThrow(/not an array/);
-    await expect(dagTool({ payload: "# raw markdown" }, { directory: process.cwd() }))
+    await expect(dagTool({ payload: "# raw markdown" }, tctx({ directory: process.cwd() })))
       .rejects.toThrow(/raw Markdown document/);
     await expect(dagTool(
       { payload: JSON.stringify(await loadStructuredPlanFixture()) },
-      { directory: process.cwd() },
+      tctx({ directory: process.cwd() }),
     )).rejects.toThrow(/JSON-encoded string/);
   });
 
   it("executes bounded_lite_plan_readiness with the structured fixture and optional dispatch", async () => {
-    const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+    const hooks = await createBoundedLitePlugin(tctx({ directory: process.cwd() }));
     const payload = await loadStructuredPlanFixture();
 
     const output = await hooks.tool?.bounded_lite_plan_readiness?.execute(
       { payload, dispatch: { concurrency: 4 } },
-      { directory: process.cwd() },
+      tctx({ directory: process.cwd() }),
     );
     const result = JSON.parse(String(output));
 
@@ -868,7 +1036,7 @@ describe("plan tool handler execution", () => {
   });
 
   it("returns one format diagnostic (not a missing-section cascade) for bad readiness payload formats", async () => {
-    const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+    const hooks = await createBoundedLitePlugin(tctx({ directory: process.cwd() }));
     const readinessTool = hooks.tool!.bounded_lite_plan_readiness!.execute;
     const markdown = [
       "---",
@@ -889,7 +1057,7 @@ describe("plan tool handler execution", () => {
       markdown,
       JSON.stringify(await loadStructuredPlanFixture()),
     ]) {
-      const output = await readinessTool({ payload: badInput }, { directory: process.cwd() });
+      const output = await readinessTool({ payload: badInput }, tctx({ directory: process.cwd() }));
       const result = JSON.parse(String(output));
 
       expect(result.executable).toBe(false);
@@ -901,7 +1069,7 @@ describe("plan tool handler execution", () => {
   });
 
   it("preserves adversarial blockers and extension metadata through the readiness handler", async () => {
-    const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+    const hooks = await createBoundedLitePlugin(tctx({ directory: process.cwd() }));
     const payload = await loadStructuredPlanFixture();
 
     payload["maturity_level"] = "M2";
@@ -920,7 +1088,7 @@ describe("plan tool handler execution", () => {
 
     const output = await hooks.tool?.bounded_lite_plan_readiness?.execute(
       { payload },
-      { directory: process.cwd() },
+      tctx({ directory: process.cwd() }),
     );
     const result = JSON.parse(String(output));
 
@@ -944,11 +1112,11 @@ describe("plan tool handler execution", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "omo-lite-plan-args-"));
 
     try {
-      const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+      const hooks = await createBoundedLitePlugin(tctx({ directory: process.cwd() }));
 
       await expect(hooks.tool?.bounded_lite_plan_artifact?.execute(
         { title: "Title Only" },
-        { directory: root },
+        tctx({ directory: root }),
       )).rejects.toThrow(/markdown.*content.*before any file write/s);
       expect(await readdir(root)).toEqual([]);
     } finally {
@@ -960,7 +1128,7 @@ describe("plan tool handler execution", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "omo-lite-plan-args-"));
 
     try {
-      const hooks = await createBoundedLitePlugin({ directory: process.cwd() });
+      const hooks = await createBoundedLitePlugin(tctx({ directory: process.cwd() }));
 
       const output = await hooks.tool?.bounded_lite_plan_artifact?.execute(
         {
@@ -969,7 +1137,7 @@ describe("plan tool handler execution", () => {
           artifactKind: "detailed-plan",
           status: "reviewed",
         },
-        { directory: root },
+        tctx({ directory: root }),
       );
       expect(String(output)).toContain("plan artifact persisted");
 
@@ -984,7 +1152,7 @@ describe("plan tool handler execution", () => {
         { title: "Bad Status", content: "# x", status: "published" },
         { title: "Bad Action", content: "# x", action: "delete" },
       ]) {
-        await expect(hooks.tool?.bounded_lite_plan_artifact?.execute(badArgs, { directory: root }))
+        await expect(hooks.tool?.bounded_lite_plan_artifact?.execute(badArgs, tctx({ directory: root })))
           .rejects.toThrow(/must be/);
       }
       expect(await readdir(plansDir)).toEqual(before);

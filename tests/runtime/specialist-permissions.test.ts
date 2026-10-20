@@ -1,5 +1,20 @@
 import { buildSpecialistFrontmatter } from "../../.opencode/lib/runtime/specialist-registry.js";
 import { createBoundedLitePlugin } from "../../.opencode/plugins/bounded-lite.js";
+import type { ToolContext } from "@opencode-ai/plugin";
+
+function tctx(ctx: { directory?: string; worktree?: string } = {}): ToolContext {
+  const directory = ctx.directory ?? process.cwd();
+  return {
+    sessionID: "ses-test",
+    messageID: "msg-test",
+    agent: "task-lead",
+    directory,
+    worktree: ctx.worktree ?? directory,
+    abort: new AbortController().signal,
+    metadata: () => {},
+    ask: () => Promise.resolve(),
+  };
+}
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -59,11 +74,11 @@ describe("specialist permission integration", () => {
       );
       const listOutput = await hooks.tool?.bounded_lite_model_config?.execute(
         { action: "list" },
-        { directory: process.cwd(), client: {} },
+        tctx({ directory: process.cwd() }),
       );
       const runtimeProfile = JSON.parse(String(await hooks.tool?.bounded_lite_runtime_profile?.execute(
         {},
-        { directory: process.cwd(), client: {} },
+        tctx({ directory: process.cwd() }),
       )));
 
       expect(String(listOutput)).toContain("security-audit");
@@ -75,7 +90,7 @@ describe("specialist permission integration", () => {
             "security-audit": { reasoningEffort: "high" },
           },
         },
-        { directory: process.cwd(), client: {} },
+        tctx({ directory: process.cwd() }),
       );
 
       const specialist = await readFile(path.join(configDir, "agents", "security-audit.md"), "utf8");

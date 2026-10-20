@@ -6,13 +6,25 @@
 // logs) inside .liteagent/scratch/opencode-compat/. Hosts are never put on PATH.
 //
 // Usage:
-//   node scripts/test-opencode-compat.mjs --stage loader
+//   node scripts/test-opencode-compat.mjs [--stage loader|v1|all]
 //
 // Stages:
-//   loader   Stage pinned hosts + fixture, run each host against the dual
+//   loader (default)
+//            Stage pinned hosts + fixture, run each host against the dual
 //            directory entrypoint, capture host-exported tool schemas and a
 //            structured echo tool round trip through a deterministic scripted
 //            OpenAI-compatible provider (no credentials, no real LLM).
+//   v1       C03 real-host gate on the two pinned v1 hosts: the REAL bounded-lite
+//            plugin (.opencode/plugins/bounded-lite.ts -> lib/compat/v1.ts ->
+//            lib/runtime/bounded-lite-core.ts) is staged as a directory entrypoint
+//            package and driven through a scripted provider. Proves: plugin load +
+//            registered bounded_lite tools, one successful structured plan-tool
+//            round trip (object-only payload contract), malformed Markdown-string
+//            payload rejection with a format diagnostic, plan artifact root
+//            confinement against the invocation worktree (nested directory case,
+//            not process.cwd), runtime model discovery through the captured init
+//            client, and a host-configured deny staying deny (no auto-allow).
+//   all      loader + v1.
 //
 // Host acquisition: official npm distribution packages with exact pins
 //   v1.18.29  opencode-ai@1.18.29     (platform pkg opencode-linux-x64)
@@ -22,7 +34,7 @@
 // postinstall.mjs is executed manually with the isolated environment instead.
 import { spawn, spawnSync } from "node:child_process"
 import { createRequire } from "node:module"
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { dirname, join, resolve } from "node:path"
 
 const require = createRequire(import.meta.url)
@@ -39,7 +51,9 @@ const HOSTS = [
 const paths = {
   hosts: join(SCROOT, "hosts"),
   fixtureStage: join(SCROOT, "fixture-stage"),
+  v1FixtureStage: join(SCROOT, "v1-fixture-stage"),
   project: join(SCROOT, "project"),
+  v1Project: join(SCROOT, "project-v1"),
   config: join(SCROOT, "config"),
   data: join(SCROOT, "data"),
   cache: join(SCROOT, "cache"),
@@ -57,7 +71,7 @@ function log(msg) {
 }
 
 function ensureDirs() {
-  for (const dir of [paths.hosts, paths.fixtureStage, paths.project, paths.config, paths.data, paths.cache, paths.home, paths.tmp, paths.logs, paths.evidence, paths.npmCache]) {
+  for (const dir of [paths.hosts, paths.fixtureStage, paths.v1FixtureStage, paths.project, paths.v1Project, paths.config, paths.data, paths.cache, paths.home, paths.tmp, paths.logs, paths.evidence, paths.npmCache]) {
     mkdirSync(dir, { recursive: true })
   }
 }
@@ -146,9 +160,39 @@ function stageFixture(host) {
   return dir
 }
 
+// Stage the REAL bounded-lite plugin as a v1 directory entrypoint package:
+// server-side copies of .opencode/{plugins,lib} preserving relative imports, a
+// ./server export, and its own dependencies installed from the warm npm cache.
+// This mirrors how a real install looks (C01 proven layout: the v1 host resolves
+// the ./server export of the configured directory and dependency resolution
+// happens from the plugin's own directory, not the checkout's node_modules).
+function stageV1Fixture(host) {
+  const dir = join(paths.v1FixtureStage, host.id)
+  rmSync(dir, { recursive: true, force: true })
+  mkdirSync(dir, { recursive: true })
+  cpSync(join(REPO_ROOT, ".opencode", "lib"), join(dir, "lib"), { recursive: true })
+  mkdirSync(join(dir, "plugins"), { recursive: true })
+  copyFileSync(join(REPO_ROOT, ".opencode", "plugins", "bounded-lite.ts"), join(dir, "plugins", "bounded-lite.ts"))
+  writeFileSync(join(dir, "server.ts"), 'export { createBoundedLitePlugin as default } from "./plugins/bounded-lite.ts"\n')
+  writeFileSync(join(dir, "package.json"), `${JSON.stringify({
+    name: "bounded-lite-v1-compat-fixture",
+    version: "0.0.0",
+    private: true,
+    type: "module",
+    description: "Real bounded-lite plugin staged as a v1 directory entrypoint for the C03 compat gate.",
+    exports: { "./server": { import: "./server.ts", types: "./server.ts" } },
+    dependencies: { "@opencode-ai/plugin": "1.19.1", "zod": "4.1.8" },
+  }, null, 2)}\n`)
+  const install = runNpm(["install", "--no-audit", "--no-fund"], dir)
+  if (install.status !== 0) throw new Error(`v1 fixture install failed for ${host.id}: ${install.stderr?.slice(-800)}`)
+  return dir
+}
+
 // Deterministic scripted provider: prints {"port": N} on stdout.
-function startProvider(port, captureOut) {
-  const child = spawn(process.execPath, [paths.provider, String(port), captureOut], {
+// Echo mode: startProvider(port, captureOut). Script mode (v1 stage) adds
+// scriptFile (tool-call steps) and requestLog (JSONL of every request body).
+function startProvider(port, captureOut, scriptFile, requestLog) {
+  const child = spawn(process.execPath, [paths.provider, String(port), captureOut, scriptFile ?? "", requestLog ?? ""].filter((arg) => arg !== ""), {
     env: { ...process.env, TMPDIR: paths.tmp },
     stdio: ["ignore", "pipe", "pipe"],
   })
@@ -206,7 +250,46 @@ function writeHostConfig(host, fixtureDir, evidenceDir, providerPort) {
   return projectDir
 }
 
-function runHost(host, bin, projectDir, evidenceDir, timeoutMs) {
+// v1 stage project layout: <projectDir> is its own git worktree root and the host
+// is invoked from <projectDir>/nested, so the invocation worktree (worktree root)
+// and the host process cwd (nested dir) differ — proving plan artifact roots
+// resolve from the invocation worktree, never from process.cwd(). The configured
+// bash deny must stay deny: the real plugin must not auto-allow host policy.
+function writeV1HostConfig(host, fixtureDir, providerPort) {
+  const projectDir = join(paths.v1Project, host.id)
+  rmSync(projectDir, { recursive: true, force: true })
+  mkdirSync(join(projectDir, "nested"), { recursive: true })
+  spawnSync("git", ["init", "-q", projectDir])
+  const config = {
+    $schema: "https://opencode.ai/config.json",
+    provider: {
+      scripted: {
+        npm: "@ai-sdk/openai-compatible",
+        name: "Scripted",
+        options: { baseURL: `http://127.0.0.1:${providerPort}/v1` },
+        models: { "echo-model": { name: "Echo Model", tool_call: true } },
+      },
+    },
+    small_model: "scripted/echo-model",
+    // Real plugin directory entrypoint (v1 dialect), no plugin options.
+    plugin: [fixtureDir],
+    permission: { bash: "deny" },
+  }
+  writeFileSync(join(projectDir, "opencode.json"), `${JSON.stringify(config, null, 2)}\n`)
+  return { projectDir, nestedDir: join(projectDir, "nested") }
+}
+
+// v2 hosts daemonize a shared `serve --service` process that outlives the runner
+// invocation. A warm service has already evaluated the plugin module, which would
+// zero the loader stage's module.eval count on repeat runs. Kill only processes
+// whose cmdline contains the STAGED host directory — the user's own opencode
+// installs never match that path.
+function killStagedHostServices(bin) {
+  spawnSync("pkill", ["-f", dirname(bin)])
+}
+
+function runHost(host, bin, projectDir, evidenceDir, timeoutMs, { prompt = "Call the echo tool once with any message.", logPrefix = host.id } = {}) {
+  killStagedHostServices(bin)
   const env = {
     PATH: "/usr/bin:/bin",
     HOME: join(paths.home, host.id),
@@ -218,14 +301,15 @@ function runHost(host, bin, projectDir, evidenceDir, timeoutMs) {
     OPENCODE_COMPAT_EVIDENCE_DIR: evidenceDir,
     OPENCODE_DISABLE_AUTOUPGRADE: "1",
   }
-  const args = ["run", "--standalone", "-m", "scripted/echo-model", "Call the echo tool once with any message.", "--format", "json"]
+  const args = ["run", "-m", "scripted/echo-model", prompt, "--format", "json"]
   if (host.line === "v1") {
     // v1 has no --standalone (it is already a private server per invocation).
     args.splice(1, 1)
   }
   const res = spawnSync(bin, args, { cwd: projectDir, env, encoding: "utf8", timeout: timeoutMs })
-  writeFileSync(join(paths.logs, `${host.id}-run.out`), res.stdout ?? "")
-  writeFileSync(join(paths.logs, `${host.id}-run.err`), res.stderr ?? "")
+  killStagedHostServices(bin)
+  writeFileSync(join(paths.logs, `${logPrefix}-run.out`), res.stdout ?? "")
+  writeFileSync(join(paths.logs, `${logPrefix}-run.err`), res.stderr ?? "")
   return res
 }
 
@@ -336,26 +420,285 @@ async function runLoaderStage() {
   return results
 }
 
+// Scripted tool-call sequence for the v1 stage (played in order by the provider).
+const V1_FINAL_TEXT = "v1-compat-final-ok"
+
+function buildV1Script() {
+  return [
+    // 1. Structured plan tool round trip: object-only payload contract (C02).
+    {
+      tool: "bounded_lite_plan_dag",
+      arguments: {
+        payload: {
+          plan: {
+            subtasks: [
+              {
+                id: "V1A",
+                depends_on: [],
+                attributes: ["code"],
+                deliverable: "Runner verification artifact",
+                description: "Valid structured DAG payload from the compat runner.",
+              },
+            ],
+          },
+        },
+      },
+    },
+    // 2. Plan artifact write: resolves its root from the invocation worktree.
+    {
+      tool: "bounded_lite_plan_artifact",
+      arguments: {
+        title: "V1 Compat Confinement Probe",
+        markdown: "---\ntitle: V1 Compat Confinement Probe\nmaturity_level: M3\n---\n\n# V1 Compat Confinement Probe\n\nRunner-generated plan artifact for worktree confinement verification.\n",
+        path: ".liteagent/plans/v1-compat-confinement-probe.md",
+      },
+    },
+    // 3. Runtime model discovery through the captured init client.
+    { tool: "bounded_lite_model_config", arguments: { action: "list" } },
+    // 4. Host-configured deny probe: must not become allow (no auto-allow).
+    { tool: "bash", arguments: { command: "echo DENIED-PROBE-OUTPUT", description: "Permission deny probe (must stay denied)" } },
+    // 5. Malformed Markdown-string payload: one format diagnostic, no cascade.
+    {
+      tool: "bounded_lite_plan_dag",
+      arguments: {
+        payload: "---\ntitle: Not An Object\n---\n\n# Raw Markdown Submission\n\n## goals\n- must be rejected as a format error\n",
+      },
+    },
+  ]
+}
+
+// Extract real tool results (per tool name, in completion order) from the JSONL
+// request log the scripted provider appends to in script mode.
+function readToolResults(requestLog) {
+  if (!existsSync(requestLog)) return []
+  const callNames = new Map()
+  const toolResults = []
+  for (const line of readFileSync(requestLog, "utf8").trim().split("\n").filter(Boolean)) {
+    let body
+    try {
+      body = JSON.parse(line)?.body
+    } catch {
+      continue
+    }
+    for (const message of body?.messages ?? []) {
+      if (message?.role === "assistant") {
+        for (const call of message?.tool_calls ?? []) {
+          if (call?.id && call?.function?.name) callNames.set(call.id, call.function.name)
+        }
+      } else if (message?.role === "tool") {
+        toolResults.push({
+          callID: message.tool_call_id ?? null,
+          name: callNames.get(message.tool_call_id) ?? `(unknown:${message.tool_call_id})`,
+          content: typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+        })
+      }
+    }
+  }
+  return toolResults
+}
+
+async function runV1Stage() {
+  ensureDirs()
+  const results = []
+
+  for (const host of HOSTS.filter((h) => h.line === "v1")) {
+    const problems = []
+    const evidenceDir = join(paths.evidence, `v1-${host.id}`)
+    rmSync(evidenceDir, { recursive: true, force: true })
+    mkdirSync(evidenceDir, { recursive: true })
+
+    let bin, version, fixtureDir
+    try {
+      bin = stageHost(host)
+      version = hostVersion(bin)
+      fixtureDir = stageV1Fixture(host)
+    } catch (error) {
+      results.push({ host: host.id, pkg: host.pkg, line: host.line, stage: "v1", ok: false, error: String(error.message ?? error) })
+      continue
+    }
+    log(`v1 host ${host.id} staged: ${bin} (${version})`)
+
+    const requestLog = join(evidenceDir, "provider-requests.jsonl")
+    writeFileSync(join(evidenceDir, "v1-script.json"), `${JSON.stringify(buildV1Script(), null, 2)}\n`)
+
+    const { child: provider, port } = await startProvider(
+      0,
+      join(evidenceDir, "provider-capture.json"),
+      join(evidenceDir, "v1-script.json"),
+      requestLog,
+    )
+    let runRes, projectDir, nestedDir
+    try {
+      ;({ projectDir, nestedDir } = writeV1HostConfig(host, fixtureDir, port))
+      runRes = runHost(host, bin, nestedDir, evidenceDir, 240_000, {
+        prompt: "Execute the scripted tool calls exactly as they arrive, in order. Do not improvise other calls.",
+        logPrefix: `v1-${host.id}`,
+      })
+    } finally {
+      provider.kill()
+    }
+
+    // Host-exported tool names from the scripted provider capture: the real
+    // plugin's bounded_lite tools must be visible to the provider.
+    let providerToolNames = []
+    try {
+      const capture = JSON.parse(readFileSync(join(evidenceDir, "provider-capture.json"), "utf8"))
+      providerToolNames = (capture.tools ?? []).map((t) => t?.function?.name).filter(Boolean)
+    } catch {}
+    const boundedTools = providerToolNames.filter((name) => name.startsWith("bounded_lite_"))
+
+    const toolResults = readToolResults(requestLog)
+
+    // (1) Real plugin load: all nine bounded_lite tools exposed, no fixture echo.
+    assert(boundedTools.length >= 9, `expected the real plugin's >= 9 bounded_lite tools, got [${boundedTools.join(", ")}]`, problems)
+    for (const required of ["bounded_lite_plan_dag", "bounded_lite_plan_readiness", "bounded_lite_plan_artifact", "bounded_lite_model_config"]) {
+      assert(boundedTools.includes(required), `real plugin tool ${required} missing from provider payload`, problems)
+    }
+    assert(!providerToolNames.includes("echo"), "fixture echo tool leaked into the v1 stage (real plugin not loaded?)", problems)
+
+    // (2) Valid structured plan_dag call round-trips with DAG waves.
+    const dagOk = toolResults.find((r) => r.name === "bounded_lite_plan_dag" && r.content.includes('"waves"'))
+    assert(Boolean(dagOk), "valid bounded_lite_plan_dag call produced no DAG waves", problems)
+    if (dagOk) {
+      let waveHits = false
+      try {
+        waveHits = JSON.stringify(JSON.parse(dagOk.content).waves[0]).includes("V1A")
+      } catch {}
+      assert(waveHits, "DAG waves do not contain the scripted subtask V1A", problems)
+    }
+
+    // (3) Malformed Markdown-string payload rejected with a format diagnostic.
+    const malformed = toolResults.filter((r) => r.name === "bounded_lite_plan_dag" && !r.content.includes('"waves"')).at(-1)
+    assert(Boolean(malformed), "Markdown-string payload was not rejected (no failing plan_dag result)", problems)
+    if (malformed) {
+      const diagnostic = /payload/i.test(malformed.content) && /(structured|object|markdown|expected)/i.test(malformed.content)
+      assert(diagnostic, `malformed payload rejection lacks a format diagnostic: ${malformed.content.slice(0, 300)}`, problems)
+    }
+
+    // (4) Artifact root confinement: worktree root, never process.cwd().
+    const artifactResult = toolResults.find((r) => r.name === "bounded_lite_plan_artifact")
+    const artifactOk = Boolean(artifactResult) && artifactResult.content.includes("plan artifact persisted")
+    assert(artifactOk, `bounded_lite_plan_artifact did not persist: ${artifactResult?.content?.slice(0, 200) ?? "no result"}`, problems)
+    const worktreeArtifact = join(projectDir, ".liteagent", "plans", "v1-compat-confinement-probe.md")
+    assert(existsSync(worktreeArtifact), `plan artifact missing under invocation worktree root: ${worktreeArtifact}`, problems)
+    assert(!existsSync(join(nestedDir, ".liteagent")), "plan artifact resolved against process.cwd() (nested dir) instead of the worktree", problems)
+
+    // (5) Runtime model discovery through the captured init client.
+    const modelResult = toolResults.find((r) => r.name === "bounded_lite_model_config")
+    const modelDiscovery = Boolean(modelResult) && modelResult.content.includes("scripted/echo-model")
+    assert(modelDiscovery, `runtime model discovery did not surface scripted/echo-model: ${modelResult?.content?.slice(0, 200) ?? "no result"}`, problems)
+
+    // (6) Configured deny stays deny. v1 host policy removes the denied tool from
+    // the provider surface entirely and rejects the scripted call ("Model tried
+    // to call unavailable tool 'bash'"); it must never execute. Match by the
+    // stable scripted call id — the host rewrites the rejected call's name.
+    const denyResult = toolResults.find((r) => r.callID === "call_scripted_3")
+    assert(Boolean(denyResult), "bash deny probe never produced a host rejection result", problems)
+    const denied = !toolResults.some((r) => r.content.includes("DENIED-PROBE-OUTPUT"))
+    assert(denied, "configured deny became allow: bash probe executed", problems)
+
+    // (7) Full scripted round trip finished with the final assistant text.
+    let roundTrip = false
+    try {
+      roundTrip = readFileSync(join(paths.logs, `v1-${host.id}-run.out`), "utf8").includes(V1_FINAL_TEXT)
+    } catch {}
+    assert(roundTrip, `final assistant text (${V1_FINAL_TEXT}) missing from run output`, problems)
+
+    assert(runRes.status === 0, `host run exited ${runRes.status}`, problems)
+
+    results.push({
+      host: host.id,
+      pkg: host.pkg,
+      line: host.line,
+      stage: "v1",
+      ok: problems.length === 0,
+      problems,
+      hostBinary: bin,
+      hostVersion: version,
+      fixtureDir,
+      evidenceDir,
+      projectDir,
+      nestedDir,
+      providerToolNames,
+      boundedToolCount: boundedTools.length,
+      tools: {
+        planDagValid: dagOk ? { ok: true, resultExcerpt: dagOk.content.slice(0, 200) } : { ok: false },
+        planArtifact: artifactOk
+          ? { ok: true, artifactPath: worktreeArtifact }
+          : { ok: false, resultExcerpt: artifactResult?.content?.slice(0, 300) ?? null },
+        modelDiscovery: modelResult
+          ? { ok: modelDiscovery, resultExcerpt: modelResult.content.slice(0, 400) }
+          : { ok: false, resultExcerpt: null },
+        denyProbe: denyResult
+          ? { denied, resultExcerpt: denyResult.content.slice(0, 300) }
+          : { missing: true },
+        planDagMalformed: malformed
+          ? { rejected: true, diagnosticExcerpt: malformed.content.slice(0, 400) }
+          : { rejected: false },
+      },
+      finalTextSeen: roundTrip,
+    })
+  }
+
+  return results
+}
+
 async function main() {
   const stageIndex = process.argv.indexOf("--stage")
   const stage = stageIndex >= 0 ? process.argv[stageIndex + 1] : "loader"
-  if (!["loader", "all"].includes(stage)) {
-    process.stderr.write(`Unknown stage: ${stage}. Supported: loader\n`)
+  if (!["loader", "v1", "all"].includes(stage)) {
+    process.stderr.write(`Unknown stage: ${stage}. Supported: loader, v1, all\n`)
     process.exit(2)
   }
-  const results = await runLoaderStage()
+
+  const runLoader = stage === "loader" || stage === "all"
+  const runV1 = stage === "v1" || stage === "all"
+
+  let loaderResults = []
+  let v1Results = []
+  if (runLoader) loaderResults = await runLoaderStage()
+  if (runV1) v1Results = await runV1Stage()
+
+  // v1-only runs keep the loader-stage host results from the previous report so
+  // the merged report still counts all three loader hosts alongside the v1 gate.
+  let carriedLoader = false
+  if (!runLoader && runV1) {
+    try {
+      const previous = JSON.parse(readFileSync(paths.report, "utf8"))
+      if (Array.isArray(previous.hosts) && previous.hosts.length > 0) {
+        loaderResults = previous.hosts
+        carriedLoader = true
+      }
+    } catch {}
+  }
+
+  const allOk =
+    (runLoader ? loaderResults.every((r) => r.ok) : true) &&
+    (runV1 ? v1Results.every((r) => r.ok) : true)
 
   const summary = {
     stage,
     ranAt: new Date().toISOString(),
     node: process.version,
-    allOk: results.every((r) => r.ok),
-    hosts: results,
+    allOk,
+    hosts: loaderResults,
+    ...(runV1 && !runLoader ? { hostsSource: carriedLoader ? "carried-from-previous-report" : "none" } : {}),
+    ...(runV1 ? { v1: v1Results, counts: {
+      loader: { ran: runLoader, carried: carriedLoader, total: loaderResults.length, passed: loaderResults.filter((r) => r.ok).length },
+      v1: { ran: runV1, total: v1Results.length, passed: v1Results.filter((r) => r.ok).length },
+    } } : {}),
   }
   writeFileSync(paths.report, `${JSON.stringify(summary, null, 2)}\n`)
 
-  for (const r of results) {
-    log(`${r.ok ? "PASS" : "FAIL"} ${r.host} (${r.hostVersion ?? "?"}) ${r.ok ? "" : "problems: " + r.problems.join("; ")}`)
+  if (runLoader) {
+    for (const r of loaderResults) {
+      log(`${r.ok ? "PASS" : "FAIL"} ${r.host} (${r.hostVersion ?? "?"}) ${r.ok ? "" : "problems: " + r.problems.join("; ")}`)
+    }
+  }
+  if (runV1) {
+    for (const r of v1Results) {
+      log(`v1 ${r.ok ? "PASS" : "FAIL"} ${r.host} (${r.hostVersion ?? "?"}) ${r.ok ? "" : "problems: " + r.problems.join("; ")}`)
+    }
   }
   log(`report: ${paths.report}`)
   process.exit(summary.allOk ? 0 : 1)

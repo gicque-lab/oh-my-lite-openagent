@@ -1,4 +1,19 @@
 import { createBoundedLitePlugin } from "../../.opencode/plugins/bounded-lite.js";
+import type { ToolContext } from "@opencode-ai/plugin";
+
+function tctx(ctx: { directory?: string; worktree?: string } = {}): ToolContext {
+  const directory = ctx.directory ?? process.cwd();
+  return {
+    sessionID: "ses-test",
+    messageID: "msg-test",
+    agent: "task-lead",
+    directory,
+    worktree: ctx.worktree ?? directory,
+    abort: new AbortController().signal,
+    metadata: () => {},
+    ask: () => Promise.resolve(),
+  };
+}
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -41,7 +56,7 @@ describe("reasoning effort DAG integration", () => {
         { directory: process.cwd() },
         { configDir },
       );
-      const context = { directory: process.cwd(), client: {} };
+      const context = tctx({ directory: process.cwd() });
       const firstRuntimeProfile = JSON.parse(String(await hooks.tool?.bounded_lite_runtime_profile?.execute(
         {},
         context,
