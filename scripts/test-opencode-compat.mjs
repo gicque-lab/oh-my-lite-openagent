@@ -24,7 +24,14 @@
 //            confinement against the invocation worktree (nested directory case,
 //            not process.cwd), runtime model discovery through the captured init
 //            client, and a host-configured deny staying deny (no auto-allow).
-//   all      loader + v1.
+//   all      loader + v1 + package.
+//   package  C06 delivery gate: npm pack into scratch + extract; install BOTH
+//            (a) from this source checkout and (b) from the extracted tarball
+//            into isolated config dirs with no ancestor repo node_modules.
+//            Proves the managed runtime dir is self-contained (server.ts shim,
+//            runtime manifest/lock with ./server export, agents/plugins/lib,
+//            locked deps resolved INSIDE the namespace) once, retains user
+//            config, and correct legacy→runtime spec migration.
 //
 // Host acquisition: official npm distribution packages with exact pins
 //   v1.18.29  opencode-ai@1.18.29     (platform pkg opencode-linux-x64)
@@ -643,21 +650,187 @@ async function runV1Stage() {
   return results
 }
 
+// ---------------------------------------------------------------------------
+// C06 package stage: deliver the runtime safely from source AND from the
+// published tarball — npm pack into scratch, extract, and install both into
+// isolated config dirs that inherit NO ancestor repository node_modules.
+// Proves: self-contained runtime files, locked deps resolved INSIDE the
+// managed namespace, exactly one active managed source, user config retention,
+// and dry run purity reported per install. Real dependency resolution happens
+// here (network for npm registry), never inside `npm test`.
+// ---------------------------------------------------------------------------
+const PKG_STAGE = join(SCROOT, "package-stage")
+
+async function runPackageStage() {
+  const results = []
+  const packDir = join(PKG_STAGE, "pack")
+  rmSync(PKG_STAGE, { recursive: true, force: true })
+  mkdirSync(packDir, { recursive: true })
+
+  // 1. npm pack from the real source root (isolated cache/env via runNpm).
+  const pack = runNpm(["pack", "--json", "--pack-destination", packDir], REPO_ROOT)
+  if (pack.status !== 0) {
+    results.push({ case: "npm-pack", ok: false, stage: "package", error: `npm pack failed: ${pack.stderr?.slice(-800)}` })
+    return results
+  }
+  let tarballName
+  try {
+    const parsed = JSON.parse(pack.stdout)
+    tarballName = Array.isArray(parsed)
+      ? parsed[0]?.filename
+      : Object.values(parsed)[0]?.filename
+  } catch {}
+  if (!tarballName) {
+    results.push({ case: "npm-pack", ok: false, stage: "package", error: `npm pack --json did not report a filename: ${pack.stdout?.slice(0, 200)}` })
+    return results
+  }
+  results.push({ case: "npm-pack", ok: true, stage: "package", tarball: tarballName })
+
+  // 2. Extract the tarball into scratch (extract dir contains its own copied
+  //    package tree; no root or ancestor node_modules exists here).
+  const extractRoot = join(PKG_STAGE, "extract")
+  mkdirSync(extractRoot, { recursive: true })
+  const tarballPath = join(packDir, tarballName)
+  const tar = spawnSync("tar", ["-xzf", tarballPath, "-C", extractRoot], { encoding: "utf8" })
+  if (tar.status !== 0) {
+    results.push({ case: "tarball-extract", ok: false, stage: "package", error: `tar extract failed: ${tar.stderr?.slice(-400)}` })
+    return results
+  }
+  const extractSrcRoot = join(extractRoot, "package")
+  results.push({
+    case: "tarball-extract",
+    ok: existsSync(join(extractSrcRoot, "scripts", "install.mjs")),
+    stage: "package",
+    srcRoot: extractSrcRoot,
+    error: existsSync(join(extractSrcRoot, "scripts", "install.mjs")) ? null : "extracted tarball missing scripts/install.mjs",
+  })
+
+  // 3. Install from source and from tarball into isolated config dirs.
+  const cases = [
+    { key: "source", srcRoot: REPO_ROOT },
+    { key: "tarball", srcRoot: extractSrcRoot },
+  ]
+  for (const { key, srcRoot } of cases) {
+    const problems = []
+    const configDir = join(PKG_STAGE, `config-${key}`)
+    mkdirSync(configDir, { recursive: true })
+    // Seed user data that must survive the install verbatim.
+    const seedConfig = {
+      $schema: "https://opencode.ai/config.json",
+      provider: { "user-prov": {} },
+      agent: { "custom-agent": { model: "openai/user-gpt" } },
+    }
+    if (key === "source") {
+      // Legacy dialect for the source install case.
+      seedConfig.plugin = ["./user-third-party.ts"]
+    } else {
+      // Native dialect for the tarball install case.
+      seedConfig.plugins = ["./user-third-party.ts"]
+    }
+    writeFileSync(join(configDir, "opencode.json"), `${JSON.stringify(seedConfig, null, 2)}\n`)
+
+    const installEnv = {
+      ...process.env,
+      HOME: paths.home,
+      XDG_CONFIG_HOME: join(paths.config, `pkg-${key}`),
+      XDG_DATA_HOME: join(paths.data, `pkg-${key}`),
+      XDG_CACHE_HOME: join(paths.cache, `pkg-${key}`),
+      TMPDIR: paths.tmp,
+      npm_config_cache: paths.npmCache,
+    }
+    delete installEnv.OPENCODE_CONFIG_DIR
+    const installCwd = join(PKG_STAGE, `work-${key}`)
+    mkdirSync(installCwd, { recursive: true })
+    const install = spawnSync(process.execPath, [
+      join(srcRoot, "scripts/install.mjs"), "--config-dir", configDir, "--root-dir", srcRoot,
+    ], { cwd: installCwd, env: installEnv, encoding: "utf8", timeout: 600_000 })
+    // ponytail: spawn errors (ENOENT cwd, signal) leave status null with empty output — surface them instead of a bare FAIL
+    const spawnError = install.error ? String(install.error.message) : null
+    writeFileSync(join(paths.logs, `package-${key}-install.out`), install.stdout ?? "")
+    writeFileSync(join(paths.logs, `package-${key}-install.out.err`), install.stderr ?? "")
+    results.push({ case: `install-${key}`, ok: install.status === 0, stage: "package", exit: install.status, ...(spawnError ? { error: spawnError } : {}), configDir, srcRoot, stdoutTail: (install.stdout ?? "").slice(-600), stderrTail: (install.stderr ?? "").slice(-600) })
+
+    // 4. Runtime self-containment + activation retention checks.
+    const runtimeDir = join(configDir, ".opencode", "oh-my-lite-openagent")
+    const dirExists = (p) => existsSync(p)
+    for (const required of ["server.ts", "package.json", "package-lock.json", "agents", "plugins", "lib"]) {
+      assert(dirExists(join(runtimeDir, required)), `runtime missing ${required}`, problems)
+    }
+    const manifest = (() => {
+      try { return JSON.parse(readFileSync(join(runtimeDir, "package.json"), "utf8")) } catch { return null }
+    })()
+    assert(Boolean(manifest?.exports?.["./server"]), "staged runtime manifest lacks the ./server export", problems)
+
+    let resolvedUnderRuntime = false
+    try {
+      // @opencode-ai/plugin is ESM-only (no "require" export condition): probe through
+      // the native ESM resolver so the staged dependency tree is the actual import ground.
+      const resolveProbe = spawnSync(process.execPath, ["--input-type=module", "-e", `
+        const root = process.argv[1];
+        for (const spec of ["@opencode-ai/plugin", "@opencode-ai/plugin/v2/effect", "zod"]) {
+          console.log(String(import.meta.resolve(spec)).replace("file://", ""));
+        }
+      `, String(runtimeDir)], {
+        cwd: runtimeDir, env: { ...installEnv }, encoding: "utf8", timeout: 60_000,
+      })
+      const lines = (resolveProbe.stdout ?? "").trim().split("\n").filter(Boolean)
+      assert(resolveProbe.status === 0, `dependency resolution probe exited ${resolveProbe.status}: ${resolveProbe.stderr?.slice(-300)}`, problems)
+      resolvedUnderRuntime = lines.length === 3 && lines.every((line) => line.startsWith(join(runtimeDir, "node_modules")))
+      assert(resolvedUnderRuntime, `runtime deps resolve outside the managed namespace: ${lines.join(" | ")}`, problems)
+    } catch (error) {
+      assert(false, `dependency resolution probe crashed: ${error}`, problems)
+    }
+
+    const after = (() => {
+      try { return JSON.parse(readFileSync(join(configDir, "opencode.json"), "utf8")) } catch { return null }
+    })()
+    assert(Boolean(after), "final opencode.json unreadable", problems)
+    if (after) {
+      const configText = JSON.stringify(after)
+      const anyManaged = configText.includes(String(runtimeDir))
+      assert(anyManaged, "config does not activate the managed runtime directory", problems)
+      assert(!configText.includes("bounded-lite.ts"), "legacy managed spec survived the install", problems)
+      assert(Boolean(after.provider?.["user-prov"]), "user provider lost", problems)
+      assert(Boolean(after.agent?.["custom-agent"]), "user custom agent lost", problems)
+      const pluginList = Array.isArray(after.plugin) ? after.plugin : Array.isArray(after.plugins) ? after.plugins : []
+      const thirdPartyEntries = pluginList.filter((item) => {
+        const spec = typeof item === "string" ? item : item?.package
+        return typeof spec === "string" && spec.includes("user-third-party")
+      })
+      assert(thirdPartyEntries.length === 1, `third-party plugin entries wrong (${thirdPartyEntries.length})`, problems)
+    }
+
+    results.push({
+      case: `verify-${key}`,
+      ok: problems.length === 0,
+      stage: "package",
+      problems,
+      runtimeDir,
+      resolvedUnderRuntime,
+      configValuesRetained: !problems.some((p) => p.includes("user")),
+    })
+  }
+
+  return results
+}
+
 async function main() {
   const stageIndex = process.argv.indexOf("--stage")
   const stage = stageIndex >= 0 ? process.argv[stageIndex + 1] : "loader"
-  if (!["loader", "v1", "all"].includes(stage)) {
-    process.stderr.write(`Unknown stage: ${stage}. Supported: loader, v1, all\n`)
+  if (!["loader", "v1", "package", "all"].includes(stage)) {
+    process.stderr.write(`Unknown stage: ${stage}. Supported: loader, v1, package, all\n`)
     process.exit(2)
   }
 
   const runLoader = stage === "loader" || stage === "all"
   const runV1 = stage === "v1" || stage === "all"
+  const runPackage = stage === "package" || stage === "all"
 
   let loaderResults = []
   let v1Results = []
   if (runLoader) loaderResults = await runLoaderStage()
   if (runV1) v1Results = await runV1Stage()
+  const packageResults = runPackage ? await runPackageStage() : []
 
   // v1-only runs keep the loader-stage host results from the previous report so
   // the merged report still counts all three loader hosts alongside the v1 gate.
@@ -674,7 +847,8 @@ async function main() {
 
   const allOk =
     (runLoader ? loaderResults.every((r) => r.ok) : true) &&
-    (runV1 ? v1Results.every((r) => r.ok) : true)
+    (runV1 ? v1Results.every((r) => r.ok) : true) &&
+    (runPackage ? packageResults.every((r) => r.ok) : true)
 
   const summary = {
     stage,
@@ -682,9 +856,12 @@ async function main() {
     node: process.version,
     allOk,
     hosts: loaderResults,
+    ...(runPackage ? { packageStage: packageResults, packageCounts: {
+      loader: { ran: runLoader, total: loaderResults.length, passed: loaderResults.filter((r) => r.ok).length },
+      package: { ran: runPackage, total: packageResults.length, passed: packageResults.filter((r) => r.ok).length },
+    } } : {}),
     ...(runV1 && !runLoader ? { hostsSource: carriedLoader ? "carried-from-previous-report" : "none" } : {}),
-    ...(runV1 ? { v1: v1Results, counts: {
-      loader: { ran: runLoader, carried: carriedLoader, total: loaderResults.length, passed: loaderResults.filter((r) => r.ok).length },
+    ...(runV1 ? { v1: v1Results, v1Counts: {
       v1: { ran: runV1, total: v1Results.length, passed: v1Results.filter((r) => r.ok).length },
     } } : {}),
   }
@@ -698,6 +875,11 @@ async function main() {
   if (runV1) {
     for (const r of v1Results) {
       log(`v1 ${r.ok ? "PASS" : "FAIL"} ${r.host} (${r.hostVersion ?? "?"}) ${r.ok ? "" : "problems: " + r.problems.join("; ")}`)
+    }
+  }
+  if (runPackage) {
+    for (const r of packageResults) {
+      log(`package ${r.ok ? "PASS" : "FAIL"} ${r.case} ${r.ok ? "" : ": " + (r.error ?? (r.problems ?? []).join("; ") ?? r.stderrTail ?? "")}`)
     }
   }
   log(`report: ${paths.report}`)

@@ -1,22 +1,45 @@
 #!/usr/bin/env node
-import { copyFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { defaultConfigDir } from "./install-paths.mjs";
+import {
+  RUNTIME_DIR_NAME,
+  runtimeBackupDir,
+  runtimeNamespaceDir,
+  runtimeNpmCacheDir,
+  runtimeStagingDir,
+} from "./install-paths.mjs";
 import { MANAGED_CONFIG } from "./managed-config.mjs";
 
 const PLUGIN_FILE = "bounded-lite.ts";
 const MANAGED_DIRS = ["agents", "plugins", "lib"];
+const RUNTIME_SHIM_FILE = "server.ts";
+// Tarball source names: npm pack always drops nested package.json(/-lock.json),
+// so the runtime manifest/lock ship under opaque names and are staged as the
+// canonical package.json / package-lock.json inside the managed namespace.
+const RUNTIME_MANIFEST_SOURCE = "runtime-package.json";
+const RUNTIME_LOCK_SOURCE = "runtime-package-lock.json";
+const MANAGED_RUNTIME_SOURCES = [RUNTIME_SHIM_FILE, RUNTIME_MANIFEST_SOURCE, RUNTIME_LOCK_SOURCE];
+const RUNTIME_STAGED_FILES = [RUNTIME_SHIM_FILE, "package.json", "package-lock.json"];
 const LITE_CONFIG_FILE = "oh-my-lite-openagent.json";
 /**
- * keep in sync with .opencode/lib/compat/config.ts (MANAGED_PLUGIN_SPECS):
- * exact managed specs only — strings that merely contain "bounded-lite.ts"
- * belong to users and must never be classified or rewritten as managed.
+ * Legacy managed specs (keep in sync with .opencode/lib/compat/config.ts,
+ * MANAGED_PLUGIN_SPECS): exact managed specs only — strings that merely contain
+ * "bounded-lite.ts" belong to users and must never be classified or rewritten
+ * as managed. The current managed source is the dedicated runtime directory
+ * (C06 decision 9); install.mjs recognizes exactly these two generations:
+ * legacy .ts specs (below) and the resolved runtime namespace directory.
  */
 const MANAGED_PLUGIN_SPECS = [
   "./.opencode/plugins/bounded-lite.ts",
 ];
+/** Managed runtime dir names/entries the installer owns; anything else found
+ * inside the runtime namespace is user data and stops the install (C06). */
+const MANAGED_RUNTIME_NAMES = new Set([...MANAGED_DIRS, ...RUNTIME_STAGED_FILES, "node_modules"]);
+/** Suffix for the disabled (renamed) superseded copied mounted entrypoint. */
+const RUNTIME_ENTRY_DISABLED_SUFFIX = ".omlo-disabled";
 const NATIVE_PERMISSION_ACTION_NAMES = {
   bash: "shell",
   task: "subagent",
@@ -635,6 +658,7 @@ async function copyDir(sourceDir, targetDir, dryRun) {
   await mkdir(targetDir, { recursive: true });
 
   for (const entry of await readdir(sourceDir)) {
+    if (entry === "node_modules") continue;
     const sourcePath = path.join(sourceDir, entry);
     const targetPath = path.join(targetDir, entry);
     const info = await stat(sourcePath);
@@ -648,6 +672,139 @@ async function copyDir(sourceDir, targetDir, dryRun) {
       await copyFile(sourcePath, targetPath);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// npm CLI launch (decision 10, plan-review PR-01): the npm JavaScript CLI is
+// always launched through process.execPath with an argument array and
+// shell:false. npm.cmd is never passed to a shell-free execFile (Windows
+// cannot exec .cmd that way), npm.Commands are never concatenated, and a
+// missing CLI is a clear failure. The installer never edits user package
+// manifests/locks.
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a real npm JavaScript CLI (bin/npm-cli.js). Accepts npm_execpath only
+ * when it identifies a valid npm.js CLI; otherwise falls back to the node
+ * install prefix. Returns null when nothing valid is found — callers must fail
+ * clearly instead of shelling out to "npm" / npm.cmd.
+ */
+export async function resolveNpmCli(execPath, env, fileExists) {
+  const fromEnv = env.npm_execpath;
+  if (typeof fromEnv === "string" && fromEnv.endsWith("npm-cli.js") && (await fileExists(fromEnv))) {
+    return { file: fromEnv, source: "npm_execpath" };
+  }
+  // Works for the standard node layout on both POSIX and win32; on win32 the
+  // prefix still ships bin/npm-cli.js next to node.exe's .. directory.
+  const fromPrefix = path.join(path.dirname(execPath), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js");
+  if (await fileExists(fromPrefix)) {
+    return { file: fromPrefix, source: "node-prefix" };
+  }
+  return null;
+}
+
+/**
+ * ExecFile plan for the locked private dependency install. Launched as:
+ * execFile(process.execPath, [npmCli.js, "ci", ...], { shell: false, cwd }).
+ * Locked install only: npm ci --ignore-scripts in the staged private runtime
+ * namespace; no arbitrary latest-package fallback, no user manifest edits.
+ */
+export function buildNpmCiPlan(execPath, npmCliFile, cwd, envExtras = {}) {
+  return {
+    file: execPath,
+    args: [npmCliFile, "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+    cwd,
+    shell: false,
+    env: {
+      ...process.env,
+      npm_config_audit: "false",
+      npm_config_fund: "false",
+      npm_config_loglevel: "notice",
+      ...envExtras,
+    },
+  };
+}
+
+/**
+ * Verify copied-stage dependency resolution offline: every runtime dependency
+ * from the copied manifest must resolve to its package.json inside the staged
+ * node_modules. Proves the npm ci stage actually produced the locked tree
+ * before the config source is switched.
+ */
+async function verifyStagedDependencies(stagingDir, dependencies) {
+  const missing = [];
+  for (const name of Object.keys(dependencies ?? {})) {
+    const manifestPath = path.join(stagingDir, "node_modules", ...name.split("/"), "package.json");
+    if (!(await fileExists(manifestPath))) missing.push(name);
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      `Staged runtime dependency resolution failed: missing ${missing.map((name) => `${name}(package.json)`).join(", ")} under ${path.join(stagingDir, "node_modules")}. npm ci may have failed silently; do not retry with arbitrary versions.`,
+    );
+  }
+}
+
+/**
+ * Real launcher: shell-free execFile of process.execPath against the npm
+ * JavaScript CLI. Injectable for offline unit tests (tests never run npm).
+ * Captures stdout/stderr and surfaces exact failures as install blockers.
+ */
+export async function defaultDependencyRunner(plan) {
+  const { execFile } = await import("node:child_process");
+  return new Promise((resolvePromise, rejectPromise) => {
+    execFile(plan.file, plan.args, { cwd: plan.cwd, env: plan.env, shell: false, encoding: "utf8" }, (error, stdout, stderr) => {
+      if (error) {
+        error.npmStderr = typeof stderr === "string" ? stderr.slice(-4000) : "";
+        error.npmStdout = typeof stdout === "string" ? stdout.slice(-2000) : "";
+        rejectPromise(error);
+        return;
+      }
+      resolvePromise({ status: 0, stdout, stderr });
+    });
+  });
+}
+
+async function runDependencyStage(context) {
+  if (context.dryRun) return null;
+
+  const npmCli = await resolveNpmCli(process.execPath, process.env, async (filePath) => {
+    try {
+      return (await stat(filePath)).isFile();
+    } catch {
+      return false;
+    }
+  });
+  if (!npmCli) {
+    throw new Error(
+      "Could not resolve a valid npm JavaScript CLI (bin/npm-cli.js). The launcher uses process.execPath with shell:false and never npm.cmd — set npm_execpath to the real npm.js CLI or install Node with bundled npm, then retry.",
+    );
+  }
+
+  const plan = buildNpmCiPlan(process.execPath, npmCli.file, context.runtimeStagingDir, {
+    npm_config_cache: context.runtimeNpmCacheDir,
+    OPENCODE_PLUGIN_STAGE: "oh-my-lite-openagent",
+  });
+  context.report.dependencyCommand = `execFile ${plan.file} ${JSON.stringify(plan.args)} (shell:false, cwd:${plan.cwd})`;
+
+  const runner = context.dependencyRunner ?? defaultDependencyRunner;
+  let result;
+  try {
+    result = await runner(plan);
+  } catch (error) {
+    throw new Error(
+      `Locked dependency install failed (npm ci --ignore-scripts) in ${context.runtimeStagingDir}: ${error.message}\nstderr: ${error.npmStderr ?? ""}\nPrevious runtime/config kept intact; no arbitrary version fallback will be attempted. Fix the environment and retry explicitly.`,
+    );
+  }
+  if (!result || result.status !== 0) {
+    throw new Error(
+      `Locked dependency install failed (npm ci --ignore-scripts) in ${context.runtimeStagingDir}: exit status ${result?.status ?? "none"}\nstderr: ${result?.stderr ?? ""}\nPrevious runtime/config kept intact; no arbitrary version fallback will be attempted. Fix the environment and retry explicitly.`,
+    );
+  }
+
+  const manifest = await readFile(path.join(context.runtimeStagingDir, "package.json"), "utf8");
+  await verifyStagedDependencies(context.runtimeStagingDir, JSON.parse(manifest).dependencies);
+  context.report.npmCliSource = npmCli.source;
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -760,10 +917,31 @@ export function isManagedPluginEntry(entry) {
   return MANAGED_PLUGIN_SPECS.includes(entry.packageSpec);
 }
 
-export function managedPluginOptions(config) {
+/**
+ * Exact managed-spec classification across both generations: the legacy .ts
+ * specs and (configDir-aware) the resolved managed runtime namespace
+ * directory. Relative specs are resolved against the config dir; absolute
+ * entries must resolve to the exact namespace. User specs that merely contain
+ * "bounded-lite.ts" never match.
+ */
+function normalizeManagedSpecCandidate(spec, configDir) {
+  if (MANAGED_PLUGIN_SPECS.includes(spec)) return spec;
+  const resolved = path.resolve(configDir, spec);
+  return resolved === contextRuntimeDir(configDir) ? spec : undefined;
+}
+
+function contextRuntimeDir(configDir) {
+  return path.join(configDir, ".opencode", RUNTIME_DIR_NAME);
+}
+
+export function isManagedSpec(entry, configDir) {
+  return normalizeManagedSpecCandidate(entry.packageSpec, configDir) !== undefined;
+}
+
+export function managedPluginOptions(config, configDir) {
   const managed = readPluginEntries(config)
-    .filter(isManagedPluginEntry)
-    .filter((entry) => !entry.removal && entry.options);
+    .filter((entry) => !entry.removal && entry.options)
+    .filter(configDir === undefined ? isManagedPluginEntry : (entry) => isManagedSpec(entry, configDir));
 
   const legacy = managed.filter((entry) => entry.container === "legacy");
   const native = managed.filter((entry) => entry.container === "native");
@@ -772,7 +950,8 @@ export function managedPluginOptions(config) {
   return lastOptions(native) ?? lastOptions(legacy) ?? {};
 }
 
-export function removeManagedPluginEntries(config, container) {
+export function removeManagedPluginEntries(config, container, configDir) {
+  const matchesManaged = configDir === undefined ? isManagedPluginEntry : (entry) => isManagedSpec(entry, configDir);
   for (const key of ["plugin", "plugins"]) {
     if (container === "legacy" && key !== "plugin") continue;
     if (container === "native" && key !== "plugins") continue;
@@ -780,19 +959,19 @@ export function removeManagedPluginEntries(config, container) {
     if (!Array.isArray(value)) continue;
     config[key] = value.filter((item) => {
       const entry = classifyPluginEntryValue(key === "plugin" ? "legacy" : "native", 0, item);
-      return !(entry && isManagedPluginEntry(entry) && !entry.removal);
+      return !(entry && matchesManaged(entry) && !entry.removal);
     });
   }
 }
 
-export function upsertManagedPluginEntry(config, spec, options) {
+export function upsertManagedPluginEntry(config, spec, options, configDir) {
   const info = detectConfigDialect(config);
   const targetNative = Array.isArray(config["plugins"]) || info.dialect === "native" || info.dialect === "mixed";
 
   if (targetNative) {
     // Managed value lives only in the effective native location; drop legacy
     // shadows but keep native array positions intact.
-    removeManagedPluginEntries(config, "legacy");
+    removeManagedPluginEntries(config, "legacy", configDir);
     const plugins = Array.isArray(config["plugins"]) ? [...config["plugins"]] : [];
     const index = plugins.findIndex((item) => {
       const entry = classifyPluginEntryValue("native", 0, item);
@@ -818,9 +997,10 @@ export function upsertManagedPluginEntry(config, spec, options) {
     : typeof pluginValue === "string"
       ? [pluginValue]
       : [];
+  const matchesManaged = configDir === undefined ? isManagedPluginEntry : (entry) => isManagedSpec(entry, configDir);
   const index = plugins.findIndex((item) => {
     const entry = classifyPluginEntryValue("legacy", 0, item);
-    return Boolean(entry && !entry.removal && isManagedPluginEntry(entry));
+    return Boolean(entry && !entry.removal && matchesManaged(entry));
   });
 
   if (index >= 0) {
@@ -889,9 +1069,10 @@ export function appendNativePermissionRules(config, rules) {
   ];
 }
 
-export function findManagedConfigConflicts(config, managedAgentNames) {
+export function findManagedConfigConflicts(config, managedAgentNames, configDir) {
   const conflicts = [];
   const managedNames = new Set(managedAgentNames);
+  const matchesManaged = configDir === undefined ? isManagedPluginEntry : (entry) => isManagedSpec(entry, configDir);
 
   const agents = nativeAgentEntries(config);
   if (agents) {
@@ -907,7 +1088,7 @@ export function findManagedConfigConflicts(config, managedAgentNames) {
   }
 
   for (const entry of readPluginEntries(config)) {
-    if (!entry.removal || !isManagedPluginEntry(entry)) continue;
+    if (!entry.removal || !matchesManaged(entry)) continue;
     conflicts.push({
       location: entry.container === "native"
         ? `plugins[${JSON.stringify(`-${entry.packageSpec}`)}]`
@@ -997,7 +1178,7 @@ function normalizeReasoningEffort(value) {
   return undefined;
 }
 
-function mergeLiteConfig(existingLiteConfig, existingOpenCodeConfig) {
+function mergeLiteConfig(existingLiteConfig, existingOpenCodeConfig, configDir) {
   const liteConfig = {
     ...createDefaultLiteConfig(),
     ...(isRecord(existingLiteConfig) ? existingLiteConfig : {}),
@@ -1038,7 +1219,7 @@ function mergeLiteConfig(existingLiteConfig, existingOpenCodeConfig) {
 
   // Profile preferences: managed plugin options are the effective source;
   // existing lite-config choices always win over migration defaults.
-  const pluginProfiles = managedPluginOptions(existingOpenCodeConfig);
+  const pluginProfiles = managedPluginOptions(existingOpenCodeConfig, configDir);
   const profilesSource = isRecord(pluginProfiles.taskLeadProfiles)
     ? pluginProfiles.taskLeadProfiles
     : (isRecord(existingOpenCodeConfig.taskLeadProfiles) ? existingOpenCodeConfig.taskLeadProfiles : {});
@@ -1195,15 +1376,19 @@ function mergeConfig(existingConfig, sourceConfig, configDir, options = {}) {
   const isNativeTarget = info.dialect === "native" || info.dialect === "mixed";
 
   // Effective managed plugin options: native entries win on mixed files.
-  const existingManagedOptions = managedPluginOptions(existingConfig);
+  // Detection spans both management generations (legacy .ts specs and the
+  // resolved runtime directory).
+  const existingManagedOptions = managedPluginOptions(existingConfig, configDir);
   const taskLeadProfiles = isRecord(existingManagedOptions.taskLeadProfiles)
     ? existingManagedOptions.taskLeadProfiles
     : undefined;
 
-  // Plugin containers: remove exact managed entries (both dialects, never user
-  // specs that merely contain the plugin filename), then upsert once in the
-  // effective container — native classed/mixed files get the native
-  // {package, options} form, legacy-classified files keep the v1 tuple.
+  // Plugin containers: remove exact managed entries from both generations
+  // (both dialects, never user specs that merely contain the plugin filename),
+  // then upsert once in the effective container — native classed/mixed files
+  // get the native {package, options} form, legacy-classified files keep the
+  // v1 tuple. The single active managed source is the runtime directory.
+  const managedSpec = contextRuntimeDir(configDir);
   const pluginContainers = {
     plugin: Array.isArray(existingConfig.plugin)
       ? [...existingConfig.plugin]
@@ -1212,8 +1397,8 @@ function mergeConfig(existingConfig, sourceConfig, configDir, options = {}) {
         : undefined,
     plugins: Array.isArray(existingConfig.plugins) ? [...existingConfig.plugins] : undefined,
   };
-  removeManagedPluginEntries(pluginContainers);
-  upsertManagedPluginEntry(pluginContainers, MANAGED_PLUGIN_SPECS[0], relativePluginOptions(configDir, taskLeadProfiles));
+  removeManagedPluginEntries(pluginContainers, undefined, configDir);
+  upsertManagedPluginEntry(pluginContainers, managedSpec, relativePluginOptions(configDir, taskLeadProfiles), configDir);
 
   // Legacy agent container: installer-owned managed + specialist names are
   // removed; unrelated custom agents are preserved verbatim. The native
@@ -1504,7 +1689,7 @@ function agentFrontmatter(agent, liteConfig, agentName, specialistNames = []) {
   return yamlLines(frontmatter).join("\n");
 }
 
-async function writeManagedAgentMarkdownFiles(rootDir, configDir, liteConfig, dryRun) {
+async function writeManagedAgentMarkdownFiles(rootDir, configDir, liteConfig, dryRun, journal) {
   const targetAgentsDir = path.join(configDir, "agents");
   if (!dryRun) await mkdir(targetAgentsDir, { recursive: true });
 
@@ -1523,14 +1708,12 @@ async function writeManagedAgentMarkdownFiles(rootDir, configDir, liteConfig, dr
     const existingContent = await fileExists(targetPath) ? await readFile(targetPath, "utf8") : "";
     const content = `---\n${agentFrontmatter(agent, liteConfig, agentName, specialistNames)}\n---\n\n${promptText.trimEnd()}\n`;
     if (!dryRun) {
-      if (existingContent) await writeFile(`${targetPath}.bak`, existingContent);
-      await writeFile(targetPath, content);
+      await writeTextFile(targetPath, content, dryRun, journal);
     }
   }
 
   for (const [specialistName, specialist] of Object.entries(liteConfig.specialists ?? {})) {
     const targetPath = path.join(targetAgentsDir, `${specialistName}.md`);
-    const existingContent = await fileExists(targetPath) ? await readFile(targetPath, "utf8") : "";
     let promptText = specialist.prompt;
     if (!promptText && specialist.promptFile) {
       promptText = await readFile(path.resolve(rootDir, specialist.promptFile), "utf8");
@@ -1538,8 +1721,7 @@ async function writeManagedAgentMarkdownFiles(rootDir, configDir, liteConfig, dr
     if (!promptText) promptText = `# ${specialistName}\n\n${specialist.description}\n`;
     const content = `---\n${yamlLines(specialistFrontmatter(specialist)).join("\n")}\n---\n\n${promptText.trimEnd()}\n`;
     if (!dryRun) {
-      if (existingContent) await writeFile(`${targetPath}.bak`, existingContent);
-      await writeFile(targetPath, content);
+      await writeTextFile(targetPath, content, dryRun, journal);
     }
   }
 }
@@ -1550,11 +1732,94 @@ async function writeBackupIfExists(filePath) {
   }
 }
 
-async function writeJson(filePath, value, dryRun) {
+/**
+ * Write journal: records prior bytes for every generated-file mutation so a
+ * failure after any partial write/swap can restore exact previous content
+ * (rollback, C06 plan risk row "installer update partially changes a working
+ * installation"). Reversed-order undo; file-on-disk .bak backups are kept
+ * independent of the journal.
+ */
+function createWriteJournal() {
+  const entries = [];
+  const journal = {
+    entries,
+    async undoAll() {
+      for (const entry of [...entries].reverse()) {
+        try {
+          if (entry.kind === "rename") {
+            if (await pathExists(entry.to)) await rm(entry.to, { recursive: true, force: true });
+            if (await pathExists(entry.from)) await rename(entry.from, entry.to);
+          } else if (entry.kind === "runtime") {
+            await undoActiveRuntime(entry);
+          } else if (entry.kind === "file") {
+            if (entry.existed) await writeFile(entry.path, entry.priorBytes ?? "");
+            else await rm(entry.path, { recursive: true, force: true });
+          }
+        } catch (undoError) {
+          entry.undoError = String(undoError?.message ?? undoError);
+        }
+      }
+    },
+  };
+  return journal;
+}
+
+async function pathExistsAny(filePath) {
+  try {
+    await stat(filePath);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function writeJson(filePath, value, dryRun, journal) {
   if (dryRun) return;
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeBackupIfExists(filePath);
+  if (journal) {
+    const existed = await pathExistsAny(filePath);
+    journal.entries.push({
+      kind: "file",
+      path: filePath,
+      existed,
+      ...(existed ? { priorBytes: await readFile(filePath, "utf8") } : {}),
+    });
+  }
   await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function writeTextFile(filePath, content, dryRun, journal) {
+  if (dryRun) return;
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeBackupIfExists(filePath);
+  if (journal) {
+    const existed = await pathExistsAny(filePath);
+    journal.entries.push({
+      kind: "file",
+      path: filePath,
+      existed,
+      ...(existed ? { priorBytes: await readFile(filePath, "utf8") } : {}),
+    });
+  }
+  await writeFile(filePath, content);
+}
+
+/**
+ * Offline test injection only: when OH_MY_LITE_TEST_DEPENDENCY_RUNNER names a
+ * module, its default export replaces the real npm launcher (single-guarded
+ * opt-in; unset means the real locked npm ci path). Never used by real runs.
+ */
+async function loadTestDependencyRunner() {
+  const injectionPath = process.env.OH_MY_LITE_TEST_DEPENDENCY_RUNNER;
+  if (!injectionPath) return undefined;
+  const mod = await import(pathToFileURL(path.resolve(injectionPath)).href);
+  const runner = mod.default ?? mod;
+  if (typeof runner !== "function") {
+    throw new Error(`OH_MY_LITE_TEST_DEPENDENCY_RUNNER module has no callable export: ${injectionPath}`);
+  }
+  return runner;
 }
 
 async function prepareInstallContext(options) {
@@ -1566,6 +1831,10 @@ async function prepareInstallContext(options) {
   const liteConfigPath = path.join(configDir, LITE_CONFIG_FILE);
   const existingConfig = await readJsonIfExists(targetConfigPath);
   const existingLiteConfig = await readJsonIfExists(liteConfigPath);
+  const dependencyRunner =
+    typeof options.dependencyRunner === "function"
+      ? options.dependencyRunner
+      : await loadTestDependencyRunner();
 
   return {
     rootDir,
@@ -1577,13 +1846,204 @@ async function prepareInstallContext(options) {
     dryRun: Boolean(options.dryRun),
     interactive: Boolean(options.interactive),
     managedMcp: options.managedMcp !== false,
+    dependencyRunner,
     sourceOpenCodeDir: path.join(rootDir, ".opencode"),
     targetOpenCodeDir: path.join(configDir, ".opencode"),
+    runtimeDir: runtimeNamespaceDir(configDir),
+    runtimeStagingDir: runtimeStagingDir(configDir),
+    runtimeBackupDir: runtimeBackupDir(configDir),
+    runtimeNpmCacheDir: runtimeNpmCacheDir(configDir),
+    report: {},
   };
 }
 
+/**
+ * Managed runtime namespace inspection (C06 failure_handling): unrecognized
+ * files or a custom (non-managed) package manifest inside the namespace stop
+ * the install instead of being overwritten or deleted.
+ */
+async function inspectManagedRuntimeNamespace(context) {
+  if (!(await pathExistsAny(context.runtimeDir))) return { exists: false, unknown: [], manifestCollision: false };
+  const unknown = [];
+  for (const entry of await readdir(context.runtimeDir)) {
+    if (!MANAGED_RUNTIME_NAMES.has(entry)) unknown.push(entry);
+  }
+  let manifestCollision = false;
+  const managedManifestPath = await managedSourceFile(context, RUNTIME_MANIFEST_SOURCE);
+  let managedManifest;
+  try {
+    managedManifest = await readFile(managedManifestPath, "utf8");
+  } catch {
+    throw missingRuntimeManifestError(context, managedManifestPath);
+  }
+  const priorManifestPath = path.join(context.runtimeDir, "package.json");
+  if (await fileExists(priorManifestPath)) {
+    let priorManifest;
+    try {
+      priorManifest = await readFile(priorManifestPath, "utf8");
+    } catch (error) {
+      throw new Error(`Managed runtime manifest ${priorManifestPath} is unreadable (${error.message}); stopping instead of overwriting.`);
+    }
+    const normalize = (text) => JSON.stringify(JSON.parse(stripTrailingCommas(stripJsonComments(text.replace(/^\uFEFF/, "")))) ?? {});
+    manifestCollision = normalize(managedManifest) !== normalize(priorManifest);
+  }
+  if (unknown.length > 0 || manifestCollision) throw runtimeNamespaceCollisionError(context, unknown, manifestCollision);
+  return { exists: true, unknown, manifestCollision };
+}
+
+function runtimeNamespaceCollisionError(context, unknown, manifestCollision) {
+  const details = [];
+  if (unknown.length > 0) {
+    details.push(`Unrecognized files inside the managed runtime namespace ${context.runtimeDir}: ${unknown.join(", ")}.`);
+  }
+  if (manifestCollision) {
+    details.push(`Your existing ${path.join(context.runtimeDir, "package.json")} does not match the managed runtime manifest (custom manifest collision).`);
+  }
+  return new Error([
+    "Install stopped: the managed runtime namespace already contains data this installer does not own.",
+    ...details,
+    "Review these files, remove or rename them yourself (no user file is ever deleted by the installer), and run the installer again.",
+  ].join("\n"));
+}
+
+async function managedSourceFile(context, fileName) {
+  // The shim + runtime manifest/lock are packaged at .opencode/ by C05/C06;
+  // prefer them there, fall back to the repo root .opencode layout.
+  const candidates = [
+    path.join(context.sourceOpenCodeDir, fileName),
+    path.join(context.rootDir, fileName),
+  ];
+  for (const candidate of candidates) {
+    if (await fileExists(candidate)) return candidate;
+  }
+  return candidates[0];
+}
+
+function missingRuntimeManifestError(context, manifestPath) {
+  return new Error(
+    `Missing managed runtime manifest source: ${manifestPath}.\n` +
+      `Expected packaged inputs: "${MANAGED_RUNTIME_SOURCES.join('", "')}" plus agents/, plugins/, lib/ under ${context.sourceOpenCodeDir}.\n` +
+      `The install requires the ${RUNTIME_SHIM_FILE} shim and the runtime manifest/lock shipped with oh-my-lite-openagent >= C06; without them the host cannot resolve the directory entrypoint. Update the source (npm view oh-my-lite-openagent version / git pull) and retry.`,
+  );
+}
+
+/**
+ * Stage managed runtime files + locked dependencies into a separate staging
+ * directory and verify resolution BEFORE switching the configured plugin
+ * source. Dry run copies nothing and runs nothing.
+ */
+async function stageManagedRuntime(context) {
+  const steps = [];
+
+  steps.push(`Upcoming current runtime: ${context.runtimeDir}${(await pathExistsAny(context.runtimeDir)) ? " (exists — will be backed up before the swap)" : " (new install)"}`);
+  steps.push(`Stage managed runtime files into ${context.runtimeStagingDir}: ${MANAGED_RUNTIME_SOURCES.join(", ")} (staged as ${RUNTIME_STAGED_FILES.slice(1).join("/")}), plus ${MANAGED_DIRS.join("/")}`);
+
+  if (context.dryRun) {
+    steps.push(`npm dependency command: ci --ignore-scripts --no-audit --no-fund (execFile ${process.execPath} with a resolved bin/npm-cli.js, shell:false) inside ${context.runtimeStagingDir}`);
+    steps.push(`npm cache: ${context.runtimeNpmCacheDir}`);
+    steps.push("Verify staged dependency resolution (node_modules manifests) before activation");
+    context.report.dependenciesInstalled = false;
+    const shimSource = path.join(context.sourceOpenCodeDir, RUNTIME_SHIM_FILE);
+    steps.push(
+      (await fileExists(shimSource))
+        ? `Shim source found: ${shimSource}`
+        : `WARNING: shim source ${shimSource} is missing (pending C05 combined-export integration); the real run will fail before activation until it exists.`,
+    );
+    return steps;
+  }
+
+  // Copy managed files into the staging namespace (a stale staging dir from an
+  // interrupted prior run is ours and is replaced wholesale).
+  await rm(context.runtimeStagingDir, { recursive: true, force: true });
+  await mkdir(context.runtimeStagingDir, { recursive: true });
+  for (const managedDir of MANAGED_DIRS) {
+    const sourceDir = path.join(context.sourceOpenCodeDir, managedDir);
+    if (!(await pathExistsAny(sourceDir))) continue;
+    await copyDir(sourceDir, path.join(context.runtimeStagingDir, managedDir), context.dryRun);
+  }
+  const runtimeFileDestinations = { [RUNTIME_SHIM_FILE]: RUNTIME_SHIM_FILE, [RUNTIME_MANIFEST_SOURCE]: "package.json", [RUNTIME_LOCK_SOURCE]: "package-lock.json" };
+  for (const [managedSource, managedDest] of Object.entries(runtimeFileDestinations)) {
+    const sourcePath = await managedSourceFile(context, managedSource);
+    if (managedSource === RUNTIME_SHIM_FILE && !(await fileExists(sourcePath))) {
+      // server.ts is delivered by the C05 combined export integration; the
+      // packed runtime cannot activate without it.
+      await rm(context.runtimeStagingDir, { recursive: true, force: true });
+      throw new Error(
+        `Missing managed runtime shim ${RUNTIME_SHIM_FILE}: expected ${path.join(context.sourceOpenCodeDir, RUNTIME_SHIM_FILE)}. The v1 host resolves the ./server export of the configured directory and the v2 host probes server.ts/index — this file is required and is integrated by the C05 combined-export workstream. Update the source and retry.`,
+      );
+    }
+    await copyFile(sourcePath, path.join(context.runtimeStagingDir, managedDest));
+  }
+
+  const result = await runDependencyStage(context);
+  context.report.dependenciesInstalled = true;
+  steps.push(`Locked dependencies installed (npm ci --ignore-scripts, ${context.report.npmCliSource} cli via ${process.execPath}, shell:false)`);
+
+  const manifest = await readFile(path.join(context.runtimeStagingDir, "package.json"), "utf8");
+  await verifyStagedDependencies(context.runtimeStagingDir, JSON.parse(manifest).dependencies);
+  steps.push(`Verified resolved runtime dependencies under ${path.join(context.runtimeStagingDir, "node_modules")}`);
+
+  return steps;
+}
+
+/**
+ * Swap the verified staging namespace into place. The prior runtime namespace
+ * (if any) is moved aside as a backup — never deleted on failure.
+ */
+async function activateRuntimeNamespace(context, journal) {
+  const priorExisted = await pathExistsAny(context.runtimeDir);
+  if (context.dryRun) return { priorExisted };
+  journal.entries.push({ kind: "runtime", priorExisted, runtimeDir: context.runtimeDir, backupDir: context.runtimeBackupDir });
+
+  if (priorExisted) {
+    await rm(context.runtimeBackupDir, { recursive: true, force: true });
+    await rename(context.runtimeDir, context.runtimeBackupDir);
+  }
+  try {
+    await rename(context.runtimeStagingDir, context.runtimeDir);
+  } catch (error) {
+    throw new Error(`Runtime namespace activation failed: ${error.message}`);
+  }
+  context.report.runtimeBackuped = priorExisted ? context.runtimeBackupDir : null;
+  return { priorExisted };
+}
+
+async function undoActiveRuntime(runtimeEntry) {
+  if (!runtimeEntry) return;
+  try {
+    await rm(runtimeEntry.runtimeDir, { recursive: true, force: true });
+    if (runtimeEntry.priorExisted) {
+      await rename(runtimeEntry.backupDir, runtimeEntry.runtimeDir);
+    }
+  } catch (undoError) {
+    runtimeEntry.undoError = String(undoError?.message ?? undoError);
+  }
+}
+
+/**
+ * Old copied-tree entrypoint: if the legacy "<config>/.opencode/plugins/
+ * bounded-lite.ts" file still exists it may be auto-discovered as a second,
+ * active copy of the plugin. Never delete user files wholesale — back it up
+ * and disable exactly this known managed entrypoint; the action is recorded
+ * and fully reversible.
+ */
+async function disableLegacyManagedEntrypoint(context, journal) {
+  const legacyFile = path.join(context.targetOpenCodeDir, "plugins", PLUGIN_FILE);
+  if (!(await fileExists(legacyFile))) return null;
+  if (context.dryRun) {
+    return `Legacy copied entrypoint ${legacyFile} still exists; the real run will back it up to ${legacyFile}.bak and disable it (rename to ${RUNTIME_ENTRY_DISABLED_SUFFIX}) so exactly one managed source stays active.`;
+  }
+  const backupPath = `${legacyFile}.bak`;
+  await writeFile(backupPath, await readFile(legacyFile, "utf8"));
+  const disabledPath = `${legacyFile}${RUNTIME_ENTRY_DISABLED_SUFFIX}`;
+  await rename(legacyFile, disabledPath);
+  journal.entries.push({ kind: "rename", from: disabledPath, to: legacyFile });
+  context.report.disabledLegacyEntrypoint = { backupPath, disabledPath };
+  return `Disabled superseded copied entrypoint: backed up to ${backupPath}, renamed to ${disabledPath}. Old copied trees stay inert (nothing under user config was deleted).`;
+}
+
 function mergeAll(context) {
-  const liteConfig = mergeLiteConfig(context.existingLiteConfig, context.existingConfig);
+  const liteConfig = mergeLiteConfig(context.existingLiteConfig, context.existingConfig, context.configDir);
   const mergedConfig = mergeConfig(context.existingConfig, MANAGED_CONFIG, context.configDir, {
     managedMcp: context.managedMcp,
     specialistNames: new Set(Object.keys(liteConfig.specialists ?? {})),
@@ -1600,8 +2060,8 @@ function installConflictNames(context, liteConfig) {
   return [...MANAGED_AGENT_NAMES, ...specialistNames];
 }
 
-function collectInstallConflicts(context, liteConfig) {
-  return findManagedConfigConflicts(context.existingConfig, installConflictNames(context, liteConfig));
+function collectInstallConflicts(context, liteConfig, configDir) {
+  return findManagedConfigConflicts(context.existingConfig, installConflictNames(context, liteConfig), configDir);
 }
 
 function formatInstallConflicts(conflicts) {
@@ -1614,16 +2074,6 @@ function formatInstallConflicts(conflicts) {
     "",
     "No files were written. Resolve the listed entries and run the installer again.",
   ].join("\n");
-}
-
-async function copyManagedDirs(context) {
-  for (const managedDir of MANAGED_DIRS) {
-    await copyDir(
-      path.join(context.sourceOpenCodeDir, managedDir),
-      path.join(context.targetOpenCodeDir, managedDir),
-      context.dryRun,
-    );
-  }
 }
 
 async function runInteractiveSetup(liteConfig, context) {
@@ -1654,10 +2104,10 @@ async function runInteractiveSetup(liteConfig, context) {
   return liteConfig;
 }
 
-async function writeOutputs(context, mergedConfig, liteConfig) {
-  await writeJson(context.targetConfigPath, mergedConfig, context.dryRun);
-  await writeJson(context.liteConfigPath, liteConfig, context.dryRun);
-  await writeManagedAgentMarkdownFiles(context.rootDir, context.configDir, liteConfig, context.dryRun);
+async function writeOutputs(context, mergedConfig, liteConfig, journal) {
+  await writeJson(context.targetConfigPath, mergedConfig, context.dryRun, journal);
+  await writeJson(context.liteConfigPath, liteConfig, context.dryRun, journal);
+  await writeManagedAgentMarkdownFiles(context.rootDir, context.configDir, liteConfig, context.dryRun, journal);
 }
 
 export async function install(options = {}) {
@@ -1667,31 +2117,77 @@ export async function install(options = {}) {
   // Stop before any file mutation (or managed-dir copy) when existing native
   // or mixed entries would shadow managed values and cannot be classified
   // without guessing. Dry runs report the same gate and write nothing.
-  const conflicts = collectInstallConflicts(context, merged.liteConfig);
+  const conflicts = collectInstallConflicts(context, merged.liteConfig, context.configDir);
   if (conflicts.length > 0) {
     throw new Error(formatInstallConflicts(conflicts));
   }
 
-  await copyManagedDirs(context);
-  const liteConfig = await runInteractiveSetup(merged.liteConfig, context);
-  await writeOutputs(context, merged.mergedConfig, liteConfig);
+  const inspection = await inspectManagedRuntimeNamespace(context);
+  context.report.runtimeNamespaceExisted = inspection.exists;
 
-  return {
-    configDir: context.configDir,
-    configPath: context.targetConfigPath,
-    liteConfigPath: context.liteConfigPath,
-    plugin: pathToFileURL(path.join(context.targetOpenCodeDir, "plugins", PLUGIN_FILE)).href,
-    dryRun: context.dryRun,
-  };
+  const journal = createWriteJournal();
+  try {
+    const stageSteps = await stageManagedRuntime(context);
+
+    if (!context.dryRun) {
+      // Activation order: runtime swap first, then configuration switch —
+      // the staged runtime is fully verified before any config source is
+      // changed. Any later failure rolls back both, restoring the exact
+      // prior bytes for every journaled generated file.
+      await activateRuntimeNamespace(context, journal);
+    }
+    const legacyDisableStep = await disableLegacyManagedEntrypoint(context, journal);
+
+    const liteConfig = await runInteractiveSetup(merged.liteConfig, context);
+    await writeOutputs(context, merged.mergedConfig, liteConfig, journal);
+
+    if (context.dryRun) {
+      context.report.plan = [
+        ...stageSteps,
+        ...(legacyDisableStep ? [legacyDisableStep] : []),
+        `Swap staging into ${context.runtimeDir} (prior namespace backed up to ${context.runtimeBackupDir})`,
+        `Backup + write ${context.targetConfigPath}`,
+        `Backup + write ${context.liteConfigPath}`,
+        `Backup + overwrite generated agent Markdown under ${path.join(context.configDir, "agents")}`,
+      ];
+      context.report.dependenciesInstalled = false;
+    }
+
+    return {
+      configDir: context.configDir,
+      configPath: context.targetConfigPath,
+      liteConfigPath: context.liteConfigPath,
+      runtimeDir: context.runtimeDir,
+      plugin: context.runtimeDir,
+      report: context.report,
+      dryRun: context.dryRun,
+    };
+  } catch (error) {
+    if (!context.dryRun) {
+      await journal.undoAll();
+    }
+    throw error;
+  }
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const result = await install(args);
+  let result;
+  try {
+    result = await install(args);
+  } finally {
+    // no-op (kept for symmetry with rollback reporting below)
+  }
 
   console.log(`OpenCode config: ${result.configPath}`);
   console.log(`Oh My Lite config: ${result.liteConfigPath}`);
-  console.log(`Bounded lite plugin: ${result.plugin}`);
+  console.log(`Managed runtime (directory entrypoint): ${result.runtimeDir}`);
+
+  if (result.dryRun && Array.isArray(result.report?.plan)) {
+    console.log("");
+    console.log("Planned install actions (dry run — nothing written, nothing installed):");
+    for (const step of result.report.plan) console.log(`  - ${step}`);
+  }
 
   if (args.interactive) {
     console.log(result.dryRun ? "Dry run with model setup complete; no files were written." : "Install with model setup complete.");

@@ -1,0 +1,17 @@
+{
+  "name": "oh-my-lite-openagent-runtime",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Managed oh-my-lite-openagent runtime package copied into <config-dir>/.opencode/oh-my-lite-openagent (C06). The v2 host supplies its own @opencode/plugin module; @opencode-ai/plugin and zod are installed explicitly during install.",
+  "exports": {
+    "./server": {
+      "import": "./server.ts",
+      "types": "./server.ts"
+    }
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.19.1",
+    "zod": "4.1.8"
+  }
+}

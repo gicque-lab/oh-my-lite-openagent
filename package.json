@@ -11,6 +11,9 @@
     ".opencode/agents/",
     ".opencode/plugins/",
     ".opencode/lib/",
+    ".opencode/server.ts",
+    ".opencode/runtime-package.json",
+    ".opencode/runtime-package-lock.json",
     "scripts/install.mjs",
     "scripts/install-paths.mjs",
     "scripts/managed-config.mjs",
@@ -19,6 +22,9 @@
     "AI-INSTALL.md",
     "AGENTS.md"
   ],
+  "exports": {
+    "./server": "./.opencode/server.ts"
+  },
   "keywords": [
     "opencode",
     "openagent",

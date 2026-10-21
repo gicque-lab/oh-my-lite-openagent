@@ -4,7 +4,25 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
+import { buildFixtureSourceRoot } from "./install-fixture.js";
+
 const execFileAsync = promisify(execFile);
+
+// Hermetic installer runs: tests use a fixture source root (the real .opencode
+// trees byte-copied, plus a local server.ts shim for the C05-pending runtime)
+// and an injected offline dependency runner — no npm/network in `npm test`.
+let fixtureRootPromise: string | undefined;
+
+async function fixtureRoot(): Promise<string> {
+  fixtureRootPromise ??= buildFixtureSourceRoot(await mkdtemp(path.join(os.tmpdir(), "omo-lite-jsonc-root-")));
+  return fixtureRootPromise;
+}
+
+const STUB_RUNNER_ENV = {
+  OH_MY_LITE_TEST_DEPENDENCY_RUNNER: path.resolve(process.cwd(), "tests/fixtures/install/stub-dependency-runner.mjs"),
+};
+
+const extraRootArgs: string[] = [];
 
 async function pathExists(filePath: string): Promise<boolean> {
   try {
@@ -18,8 +36,13 @@ async function pathExists(filePath: string): Promise<boolean> {
 async function runInstaller(configDir: string): Promise<string> {
   const result = await execFileAsync(
     process.execPath,
-    [path.resolve(process.cwd(), "scripts/install.mjs"), "--config-dir", configDir],
-    { cwd: process.cwd() },
+    [
+      path.resolve(process.cwd(), "scripts/install.mjs"),
+      "--config-dir", configDir,
+      "--root-dir", await fixtureRoot(),
+      ...extraRootArgs,
+    ],
+    { cwd: process.cwd(), env: { ...process.env, ...STUB_RUNNER_ENV } },
   );
   return result.stdout;
 }
@@ -27,8 +50,14 @@ async function runInstaller(configDir: string): Promise<string> {
 async function runInstallerWithArgs(configDir: string, extraArgs: string[]): Promise<string> {
   const result = await execFileAsync(
     process.execPath,
-    [path.resolve(process.cwd(), "scripts/install.mjs"), "--config-dir", configDir, ...extraArgs],
-    { cwd: process.cwd() },
+    [
+      path.resolve(process.cwd(), "scripts/install.mjs"),
+      "--config-dir", configDir,
+      "--root-dir", await fixtureRoot(),
+      ...extraRootArgs,
+      ...extraArgs,
+    ],
+    { cwd: process.cwd(), env: { ...process.env, ...STUB_RUNNER_ENV } },
   );
   return result.stdout;
 }
@@ -58,9 +87,13 @@ describe("global installer JSONC config handling", () => {
       );
 
       const output = await runInstaller(configDir);
+      const sourceRoot = await fixtureRoot();
       const writtenConfig = JSON.parse(await readFile(jsoncPath, "utf8"));
       const liteConfig = JSON.parse(await readFile(path.join(configDir, "oh-my-lite-openagent.json"), "utf8"));
       const generatedCommandLead = await readFile(path.join(configDir, "agents", "command-lead.md"), "utf8");
+      // The managed source is the private runtime directory (C06), still
+      // configured as the active plugin source.
+      expect(output).toContain(`Managed runtime (directory entrypoint): ${path.join(configDir, ".opencode", "oh-my-lite-openagent")}`);
 
       expect(output).toContain(`OpenCode config: ${jsoncPath}`);
       expect(output).toContain(`Oh My Lite config: ${path.join(configDir, "oh-my-lite-openagent.json")}`);
@@ -71,16 +104,16 @@ describe("global installer JSONC config handling", () => {
       expect(writtenConfig.command["update-lite"].agent).toBe("command-lead");
       expect(writtenConfig.command["update-lite"].template).not.toContain("__OH_MY_LITE_SOURCE_ROOT__");
       expect(writtenConfig.command["update-lite"].template).not.toContain("__OH_MY_LITE_CONFIG_DIR__");
-      expect(writtenConfig.command["update-lite"].template).toContain(process.cwd());
+      expect(writtenConfig.command["update-lite"].template).toContain(sourceRoot);
       expect(writtenConfig.command["update-lite"].template).toContain(configDir);
       expect(writtenConfig.command["update-lite"].template).toContain(
-        `git -C "${process.cwd()}" pull --ff-only`,
+        `git -C "${sourceRoot}" pull --ff-only`,
       );
       expect(writtenConfig.command["update-lite"].template).toContain(
-        `node "${path.join(process.cwd(), "scripts/install.mjs")}" --root-dir "${process.cwd()}" --config-dir "${configDir}"`,
+        `node "${path.join(sourceRoot, "scripts/install.mjs")}" --root-dir "${sourceRoot}" --config-dir "${configDir}"`,
       );
       expect(writtenConfig.permission.bash[
-        `node "${path.join(process.cwd(), "scripts/install.mjs")}" --root-dir "${process.cwd()}" --config-dir "${configDir}"`
+        `node "${path.join(sourceRoot, "scripts/install.mjs")}" --root-dir "${sourceRoot}" --config-dir "${configDir}"`
       ]).toBe("allow");
       expect(writtenConfig.plugin).toContain("./custom-plugin.ts");
       expect(writtenConfig.agent["custom-agent"].model).toBe("openai/gpt-5.4");
