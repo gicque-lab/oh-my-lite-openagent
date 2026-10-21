@@ -30,6 +30,7 @@ import {
   type ModelFamily,
   type ModelPoolPolicy,
   type ModelProviderSource,
+  type ProviderModel,
   resolveAutoModels,
   resolveAutoReasoningEffortAssignments,
   resolveAutoTaskLeadProfileModels,
@@ -231,6 +232,13 @@ export interface PluginInitContext {
   directory?: string;
   worktree?: string;
   serverUrl?: unknown;
+  /**
+   * Runtime model inventory override for hosts without a v1-style client.
+   * The v2 adapter supplies it from the host's captured `ctx.model.list`
+   * domain; when present the model-config handler uses it instead of probing
+   * `client.config.providers` / `client.provider.list`.
+   */
+  runtimeModels?: () => Promise<ProviderModel[]>;
 }
 
 /**
@@ -421,9 +429,13 @@ function readStudyPackageStage(args: Record<string, unknown>): "sources" | "full
   return stage === "sources" || stage === "source-index" ? "sources" : "full";
 }
 
-async function generateStudyPackage(directory: string, stage: "sources" | "full" = "full"): Promise<Record<string, unknown>> {
+async function generateStudyPackage(
+  directory: string,
+  stage: "sources" | "full" = "full",
+  cancellation?: AbortSignal,
+): Promise<Record<string, unknown>> {
   const coursewareDir = path.resolve(directory);
-  const sourceIndex = await ingestStudyCourseware(coursewareDir);
+  const sourceIndex = await ingestStudyCourseware(coursewareDir, cancellation);
   const sources = Array.isArray(sourceIndex.sources) ? sourceIndex.sources.filter(isRecord) : [];
   const agentsPath = path.join(coursewareDir, "AGENTS.md");
   const agentsResult = upsertStudyAgentsBlock(await readOptionalFile(agentsPath), sources.length);
@@ -652,13 +664,19 @@ function extractPdfPages(buffer: Buffer): StudySlide[] {
   return extractPdfPagesFromText(text, "pdf-literal-fallback", pageCount);
 }
 
-async function extractPdfPagesWithOptionalTool(filePath: string, buffer: Buffer): Promise<StudySlide[]> {
+async function extractPdfPagesWithOptionalTool(
+  filePath: string,
+  buffer: Buffer,
+  cancellation?: AbortSignal,
+): Promise<StudySlide[]> {
   const pdftotext = await findExecutableOnPath(process.platform === "win32" ? ["pdftotext.exe", "pdftotext"] : ["pdftotext"]);
   if (pdftotext) {
     try {
       const { stdout } = await execFileAsync(pdftotext, ["-layout", filePath, "-"], {
         timeout: 10_000,
         maxBuffer: 20 * 1024 * 1024,
+        // Owned child process: killed together with the invocation signal.
+        ...(cancellation && !cancellation.aborted ? { signal: cancellation } : {}),
       });
       const text = String(stdout).trim();
       if (text !== "") return extractPdfPagesFromText(text, "pdftotext", Math.max(1, text.split("\f").length));
@@ -700,6 +718,7 @@ async function findConvertedCoursewareFile(directory: string, baseName: string):
 async function convertLegacyPptWithSoffice(
   filePath: string,
   soffice: string,
+  cancellation?: AbortSignal,
 ): Promise<{ convertedPath?: string; outputDirectory: string; error?: string }> {
   const conversionDirectory = path.join(os.tmpdir(), `omo-lite-ppt-${Date.now()}-${Math.random().toString(16).slice(2)}`);
 
@@ -715,6 +734,8 @@ async function convertLegacyPptWithSoffice(
     ], {
       timeout: 30_000,
       maxBuffer: 10 * 1024 * 1024,
+      // Owned child process: killed together with the invocation signal.
+      ...(cancellation && !cancellation.aborted ? { signal: cancellation } : {}),
     });
     const convertedPath = await findConvertedCoursewareFile(conversionDirectory, path.basename(filePath, path.extname(filePath)));
     return {
@@ -729,15 +750,20 @@ async function convertLegacyPptWithSoffice(
   }
 }
 
-async function extractSlidesFromCoursewareFile(filePath: string, extension: string): Promise<StudySlide[]> {
+async function extractSlidesFromCoursewareFile(
+  filePath: string,
+  extension: string,
+  cancellation?: AbortSignal,
+): Promise<StudySlide[]> {
   const buffer = await readFile(filePath);
   if (extension === ".pptx") return extractPptxSlides(buffer);
-  if (extension === ".pdf") return extractPdfPagesWithOptionalTool(filePath, buffer);
+  if (extension === ".pdf") return extractPdfPagesWithOptionalTool(filePath, buffer, cancellation);
   return [];
 }
 
 async function ingestStudyCourseware(
   directory: string,
+  cancellation?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   const coursewareDir = path.resolve(directory);
   const entries = await readdir(coursewareDir, { withFileTypes: true });
@@ -793,7 +819,7 @@ async function ingestStudyCourseware(
         continue;
       }
 
-      const conversion = await convertLegacyPptWithSoffice(filePath, soffice);
+      const conversion = await convertLegacyPptWithSoffice(filePath, soffice, cancellation);
       source.converter = soffice;
       source.conversion = {
         method: "soffice",
@@ -818,12 +844,12 @@ async function ingestStudyCourseware(
       }
 
       const convertedExtension = path.extname(conversion.convertedPath).toLowerCase();
-      slides = (await extractSlidesFromCoursewareFile(conversion.convertedPath, convertedExtension)).map((slide) => ({
+      slides = (await extractSlidesFromCoursewareFile(conversion.convertedPath, convertedExtension, cancellation)).map((slide) => ({
         ...slide,
         extractionMethod: `soffice->${slide.extractionMethod ?? convertedExtension.slice(1)}`,
       }));
     } else {
-      slides = await extractSlidesFromCoursewareFile(filePath, extension);
+      slides = await extractSlidesFromCoursewareFile(filePath, extension, cancellation);
     }
 
     const allText = slides.map((slide) => slide.text).join("\n");
@@ -1054,6 +1080,14 @@ async function readRuntimeLiteConfig(configDir?: string): Promise<{
   };
 }
 
+/**
+ * Exported for the C05 v2 session request hook: stored role/specialist
+ * reasoning preferences come from oh-my-lite-openagent.json through the same
+ * config boundary the tools use. Stored values are advisory inputs to the
+ * hook, never proof of runtime effectiveness.
+ */
+export { readRuntimeLiteConfig };
+
 async function readOpenCodeAuthProviderIds(): Promise<string[]> {
   try {
     const content = await readFile(path.join(defaultDataDir(), "auth.json"), "utf8");
@@ -1280,14 +1314,24 @@ async function listRuntimeProviderModels(
   }
 }
 
-async function listModelsDevProviderModels(providerIds: readonly string[]): Promise<ReturnType<typeof listProviderModels>> {
+async function listModelsDevProviderModels(
+  providerIds: readonly string[],
+  cancellation?: AbortSignal,
+): Promise<ReturnType<typeof listProviderModels>> {
   if (providerIds.length === 0) return [];
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 1_000);
+  // Owned outbound fetch: abort together with the invocation signal so a
+  // stopped session never leaves this model-catalog fetch running.
+  const signals = cancellation && !cancellation.aborted
+    ? [controller.signal, cancellation]
+    : [controller.signal];
 
   try {
-    const response = await fetch("https://models.dev/api.json", { signal: controller.signal });
+    const response = await fetch("https://models.dev/api.json", {
+      signal: typeof AbortSignal.any === "function" ? AbortSignal.any(signals) : controller.signal,
+    });
     if (!response.ok) return [];
 
     return listProviderModelsFromModelsDevResponse(await response.json(), providerIds);
@@ -1388,6 +1432,11 @@ export type CoreToolDefinition = {
 export interface BoundedLiteCoreHooks {
   config?: (input: unknown) => Promise<void>;
   tool: Record<string, CoreToolDefinition>;
+  /**
+   * Cancels coordinator-owned background work. Hosts that terminate the plugin
+   * should call it; the host itself owns transforms and hooks.
+   */
+  disposeResources?: () => void;
 }
 
 export async function createBoundedLiteCore(
@@ -1412,6 +1461,17 @@ export async function createBoundedLiteCore(
         throw new Error(
           `maxChildDepth must stay <= ${MAX_CHILD_ORCHESTRATOR_DEPTH} to preserve bounded orchestration.`,
         );
+      }
+    },
+    disposeResources() {
+      for (const task of background.list()) {
+        if (task.status === "submitted" || task.status === "running") {
+          try {
+            background.cancel(task.id, "plugin setup disposed");
+          } catch {
+            // Task already settled; never let cleanup throw.
+          }
+        }
       }
     },
     tool: {
@@ -1559,7 +1619,7 @@ export async function createBoundedLiteCore(
           allowExternalDirectory: z.boolean().optional(),
         },
         async execute(args, context) {
-          return formatToolJsonOutput(await ingestStudyCourseware(resolveStudyDirectory(args, context)));
+          return formatToolJsonOutput(await ingestStudyCourseware(resolveStudyDirectory(args, context), context?.abort));
         },
       },
       bounded_lite_study_package: {
@@ -1572,7 +1632,7 @@ export async function createBoundedLiteCore(
         async execute(args, context) {
           const studyDirectory = resolveStudyDirectory(args, context);
           await assertInvocationPermission(context, [path.relative(process.cwd(), studyDirectory) || studyDirectory]);
-          return formatToolJsonOutput(await generateStudyPackage(studyDirectory, readStudyPackageStage(args)));
+          return formatToolJsonOutput(await generateStudyPackage(studyDirectory, readStudyPackageStage(args), context?.abort));
         },
       },
       bounded_lite_model_config: {
@@ -1641,8 +1701,10 @@ If no provider models are found, tell the user to configure or connect OpenCode 
             liteConfig,
           );
           const credentialProviderIds = await readOpenCodeAuthProviderIds();
-          const runtimeModels = await listRuntimeProviderModels(capturedClient, { directory: context?.directory, worktree: context?.worktree });
-          const modelsDevModels = await listModelsDevProviderModels(credentialProviderIds);
+          const runtimeModels = initInput.runtimeModels
+            ? await initInput.runtimeModels()
+            : await listRuntimeProviderModels(capturedClient, { directory: context?.directory, worktree: context?.worktree });
+          const modelsDevModels = await listModelsDevProviderModels(credentialProviderIds, context?.abort);
           const credentialModels = listKnownModelsForCredentialProviders(
             credentialProviderIds,
           );
