@@ -24,7 +24,21 @@
 //            confinement against the invocation worktree (nested directory case,
 //            not process.cwd), runtime model discovery through the captured init
 //            client, and a host-configured deny staying deny (no auto-allow).
-//   all      loader + v1 + package.
+//   delegation C07 role-topology gate on ALL pinned hosts (all three): managed
+//            agent definitions + managed task permission maps + the dialect
+//            depth key are injected directly into an isolated project config
+//            (no plugin fixture needed — pure host dispatch/permission/depth
+//            behavior through the scripted provider in global-cursor mode).
+//            Proves per case: allowed chains (command-lead->task-lead->explore,
+//            command-lead->deep-plan-builder->plan-review->explore at depth 3,
+//            direct entrypoint review/planner paths), forbidden chains
+//            (task-lead->task-lead, explore->task-lead retrieval widening,
+//            disabled build/plan dispatch, unknown specialist), the strict
+//            user depth ceiling staying strict (depth-1 config rejects the
+//            deepest chain with the host depth error), and hidden roles staying
+//            absent from the host-built task/subagent tool description while
+//            still resolving by ID.
+//   all      loader + v1 + delegation + package.
 //   package  C06 delivery gate: npm pack into scratch + extract; install BOTH
 //            (a) from this source checkout and (b) from the extracted tarball
 //            into isolated config dirs with no ancestor repo node_modules.
@@ -198,8 +212,10 @@ function stageV1Fixture(host) {
 // Deterministic scripted provider: prints {"port": N} on stdout.
 // Echo mode: startProvider(port, captureOut). Script mode (v1 stage) adds
 // scriptFile (tool-call steps) and requestLog (JSONL of every request body).
-function startProvider(port, captureOut, scriptFile, requestLog) {
-  const child = spawn(process.execPath, [paths.provider, String(port), captureOut, scriptFile ?? "", requestLog ?? ""].filter((arg) => arg !== ""), {
+// Global-cursor mode (C07 delegation stage) adds "global" so nested subagent
+// sessions consume scripted tool-call steps in one depth-first order.
+function startProvider(port, captureOut, scriptFile, requestLog, globalCursor) {
+  const child = spawn(process.execPath, [paths.provider, String(port), captureOut, scriptFile ?? "", requestLog ?? "", ...(globalCursor ? [globalCursor] : [])].filter((arg) => arg !== ""), {
     env: { ...process.env, TMPDIR: paths.tmp },
     stdio: ["ignore", "pipe", "pipe"],
   })
@@ -651,6 +667,327 @@ async function runV1Stage() {
 }
 
 // ---------------------------------------------------------------------------
+// C07 delegation stage: managed role topology, hidden-role dispatch, forbidden
+// chains and host session depth on the pinned real hosts. Config-only harness:
+// managed agents + permission maps + dialect depth key written into an isolated
+// project opencode.json; no plugin fixture (plugin behavior is the v1 stage's
+// job). The scripted provider runs in global-cursor mode so nested subagent
+// sessions consume script steps in depth-first order.
+// ---------------------------------------------------------------------------
+import { MANAGED_CONFIG } from "./managed-config.mjs"
+
+const DELEGATION_PROJECT_ROOT = join(SCROOT, "project-delegation")
+
+function delegationTool(host) {
+  return host.line === "v1"
+    ? { tool: "task", agentField: "subagent_type" }
+    : { tool: "subagent", agentField: "agent" }
+}
+
+function writeDelegationProject(host, caseKey, providerPort, subagentDepth) {
+  const projectDir = join(DELEGATION_PROJECT_ROOT, host.id, caseKey)
+  rmSync(projectDir, { recursive: true, force: true })
+  mkdirSync(projectDir, { recursive: true })
+  spawnSync("git", ["init", "-q", projectDir])
+  const agents = {}
+  for (const [name, def] of Object.entries(MANAGED_CONFIG.agent)) {
+    const { prompt, ...rest } = def
+    agents[name] = rest
+  }
+  const config = {
+    $schema: "https://opencode.ai/config.json",
+    provider: {
+      scripted: {
+        npm: "@ai-sdk/openai-compatible",
+        name: "Scripted",
+        options: { baseURL: `http://127.0.0.1:${providerPort}/v1` },
+        models: { "echo-model": { name: "Echo Model", tool_call: true } },
+      },
+    },
+    small_model: "scripted/echo-model",
+    default_agent: "command-lead",
+    permission: JSON.parse(JSON.stringify(MANAGED_CONFIG.permission)),
+    agent: agents,
+  }
+  if (host.line === "v1") {
+    config.subagent_depth = subagentDepth
+  } else {
+    config.experimental = { subagent_depth: subagentDepth }
+  }
+  writeFileSync(join(projectDir, "opencode.json"), `${JSON.stringify(config, null, 2)}\n`)
+  return projectDir
+}
+
+function buildDelegationScript(host, agentNames) {
+  const { tool, agentField } = delegationTool(host)
+  return agentNames.map((agent, index) => ({
+    tool,
+    arguments: {
+      description: `delegation step ${index}`,
+      prompt: `Scripted delegation probe step ${index}. Finish immediately with a final text answer; do not call other tools.`,
+      [agentField]: agent,
+    },
+  }))
+}
+
+const DELEGATION_FINAL_TEXT = "v1-compat-final-ok"
+// Failure phrasing is host-specific: v1 states a permission rule prevented the
+// call ("The user has specified a rule which prevents you from using this
+// specific tool call"), v2 may deny by permission ("Subagent denied") or by
+// removing the tool from that agent's surface entirely ("No tool named
+// "subagent" is currently available"), and unknown ids surface as host
+// "Agent not found"/"Unknown agent" errors.
+const DELEGATION_FAILURE_PATTERNS = {
+  permission: /denied|not allowed|prevents you from using|unavailable tool|no tool named|currently available|permission/i,
+  unknown: /not found|unknown|prevents you from using|unavailable tool|no tool named|currently available/i,
+  depth: /depth limit/i,
+}
+
+const DELEGATION_CASES = [
+  {
+    key: "allowed-task-lead-chain",
+    agents: ["task-lead", "explore"],
+    subagentDepth: 3,
+    okIndexes: [0, 1],
+  },
+  {
+    key: "allowed-deep-review-chain",
+    agents: ["deep-plan-builder", "plan-review", "explore"],
+    subagentDepth: 3,
+    okIndexes: [0, 1, 2],
+  },
+  {
+    key: "allowed-review-direct",
+    agents: ["plan-review", "explore"],
+    subagentDepth: 3,
+    okIndexes: [0, 1],
+  },
+  {
+    key: "allowed-planner-direct",
+    agents: ["plan-builder", "explore"],
+    subagentDepth: 3,
+    okIndexes: [0, 1],
+  },
+  {
+    key: "forbidden-recursive-task-lead",
+    agents: ["task-lead", "task-lead"],
+    subagentDepth: 3,
+    okIndexes: [0],
+    failIndexes: { 1: DELEGATION_FAILURE_PATTERNS.permission },
+  },
+  {
+    key: "forbidden-retrieval-widening",
+    agents: ["explore", "task-lead"],
+    subagentDepth: 3,
+    okIndexes: [0],
+    failIndexes: { 1: DELEGATION_FAILURE_PATTERNS.permission },
+  },
+  {
+    key: "forbidden-disabled-builtin",
+    agents: ["build"],
+    subagentDepth: 3,
+    okIndexes: [],
+    failIndexes: { 0: DELEGATION_FAILURE_PATTERNS.permission },
+  },
+  {
+    key: "forbidden-unknown-specialist",
+    agents: ["ghost-specialist"],
+    subagentDepth: 3,
+    okIndexes: [],
+    failIndexes: { 0: DELEGATION_FAILURE_PATTERNS.unknown },
+  },
+  {
+    key: "stricter-user-depth-blocker",
+    agents: ["deep-plan-builder", "plan-review"],
+    subagentDepth: 1,
+    okIndexes: [0],
+    failIndexes: { 1: DELEGATION_FAILURE_PATTERNS.depth },
+  },
+  {
+    key: "hidden-catalog-and-resolvable",
+    agents: ["explore"],
+    subagentDepth: 3,
+    okIndexes: [0],
+    catalog: true,
+  },
+]
+
+function readCatalogDescription(host, requestLog) {
+  let catalog = null
+  try {
+    const lines = readFileSync(requestLog, "utf8").trim().split("\n").filter(Boolean)
+    for (const line of lines) {
+      let body
+      try { body = JSON.parse(line)?.body } catch { continue }
+      const tools = body?.tools
+      if (!Array.isArray(tools) || tools.length === 0) continue
+      const delegation = tools.find((t) => t?.function?.name === delegationTool(host).tool)
+      if (delegation?.function?.description) return delegation.function.description
+    }
+  } catch {}
+  return catalog
+}
+
+async function runDelegationStage() {
+  ensureDirs()
+  mkdirSync(DELEGATION_PROJECT_ROOT, { recursive: true })
+  const results = []
+
+  for (const host of HOSTS) {
+    let bin, version
+    try {
+      bin = stageHost(host)
+      version = hostVersion(bin)
+    } catch (error) {
+      results.push({ host: host.id, pkg: host.pkg, line: host.line, stage: "delegation", ok: false, error: String(error.message ?? error) })
+      continue
+    }
+    log(`delegation host ${host.id} staged: ${bin} (${version})`)
+
+    for (const delegationCase of DELEGATION_CASES) {
+      const problems = []
+      const evidenceDir = join(paths.evidence, `deleg-${delegationCase.key}-${host.id}`)
+      rmSync(evidenceDir, { recursive: true, force: true })
+      mkdirSync(evidenceDir, { recursive: true })
+      const requestLog = join(evidenceDir, "provider-requests.jsonl")
+      const script = buildDelegationScript(host, delegationCase.agents)
+      writeFileSync(join(evidenceDir, "case-script.json"), `${JSON.stringify(script, null, 2)}\n`)
+
+      const { child: provider, port } = await startProvider(
+        0,
+        join(evidenceDir, "provider-capture.json"),
+        join(evidenceDir, "case-script.json"),
+        requestLog,
+        "global",
+      )
+      let runRes, projectDir
+      try {
+        projectDir = writeDelegationProject(host, delegationCase.key, port, delegationCase.subagentDepth)
+        log(`delegation ${host.id} ${delegationCase.key} running`)
+        runRes = runHost(host, bin, projectDir, evidenceDir, 240_000, {
+          prompt: "Execute the scripted tool calls exactly as they arrive, in order. Do not improvise other calls.",
+          logPrefix: `deleg-${delegationCase.key}-${host.id}`,
+        })
+      } finally {
+        provider.kill()
+      }
+
+      const toolResults = readToolResults(requestLog).filter((r) => r.callID?.startsWith("call_scripted_"))
+      const resultFor = (index) => toolResults.find((r) => r.callID === `call_scripted_${index}`) ?? null
+
+      const okResults = (delegationCase.okIndexes ?? []).map(resultFor)
+      okResults.forEach((r, i) => {
+        assert(r !== null, `scripted step ${i} produced no result`, problems)
+        if (r) {
+          assert(
+            r.content.includes(DELEGATION_FINAL_TEXT),
+            `scripted step ${i} (${delegationCase.agents[i]}) did not complete with the subagent final text: ${r.content.slice(0, 260)}`,
+            problems,
+          )
+        }
+      })
+      for (const [index, pattern] of Object.entries(delegationCase.failIndexes ?? {})) {
+        const r = resultFor(Number(index))
+        assert(r !== null, `expected failure at scripted step ${index} (${delegationCase.agents[Number(index)]}) but no result arrived`, problems)
+        if (r) {
+          assert(
+            !r.content.includes(DELEGATION_FINAL_TEXT),
+            `forbidden dispatch at scripted step ${index} (${delegationCase.agents[Number(index)]}) unexpectedly completed`,
+            problems,
+          )
+          assert(
+            pattern.test(r.content),
+            `failure at scripted step ${index} lacks an expected diagnostic: ${r.content.slice(0, 260)}`,
+            problems,
+          )
+        }
+      }
+
+      if (delegationCase.catalog) {
+        const description = readCatalogDescription(host, requestLog)
+        assert(Boolean(description), `no ${delegationTool(host).tool} tool description observed in provider requests`, problems)
+        if (description) {
+          const catalog = new Set(
+            description.split("\n").filter((line) => /^- [a-z-]+:/i.test(line)).map((line) => line.slice(2).split(":")[0]),
+          )
+          // Disabled hidden overrides are never dispatch targets on any host.
+          for (const id of ["build", "plan"]) {
+            assert(
+              !catalog.has(id),
+              `disabled built-in override ${id} leaked into the host ${delegationTool(host).tool} tool catalog`,
+              problems,
+            )
+          }
+          if (host.line === "v1") {
+            // Pinned v1 hosts supply the hidden managed roles right in the task
+            // tool catalog (this is the v1 hidden-ID supply channel; it must
+            // not silently disappear).
+            for (const id of ["task-lead", "explore", "librarian", "plan-review", "result-review"]) {
+              assert(
+                catalog.has(id),
+                `v1 task catalog lost hidden-but-permitted role ${id}`,
+                problems,
+              )
+            }
+          } else {
+            // Pinned v2 hosts omit hidden agents from the subagent tool catalog
+            // (live-evidenced in the host binary); hidden roles stay invisible
+            // while remaining resolvable by exact ID (proven by the chain
+            // cases). The plugin's tool-description guidance is the C07 supply
+            // channel for these IDs and is pinned by unit tests.
+            for (const id of ["task-lead", "explore", "librarian", "plan-review", "result-review"]) {
+              assert(
+                !catalog.has(id),
+                `v2 subagent catalog unexpectedly exposes hidden role ${id}`,
+                problems,
+              )
+            }
+            assert(
+              catalog.has("plan-builder"),
+              "v2 subagent catalog lost the visible managed planner entry",
+              problems,
+            )
+          }
+          results.push({
+            host: host.id,
+            pkg: host.pkg,
+            line: host.line,
+            stage: "delegation",
+            case: delegationCase.key,
+            subagentDepth: delegationCase.subagentDepth,
+            catalogRoles: [...catalog].sort(),
+            ok: problems.length === 0,
+            problems,
+            projectDir,
+            evidenceDir,
+          })
+          continue
+        }
+      }
+
+      // Chains must finish: the host run exits cleanly with the final text.
+      assert(runRes.status === 0, `host run exited ${runRes.status}`, problems)
+
+      results.push({
+        host: host.id,
+        pkg: host.pkg,
+        line: host.line,
+        stage: "delegation",
+        case: delegationCase.key,
+        subagentDepth: delegationCase.subagentDepth,
+        ok: problems.length === 0,
+        problems,
+        projectDir,
+        evidenceDir,
+      })
+    }
+  }
+
+  return results
+}
+
+
+// ---------------------------------------------------------------------------
 // C06 package stage: deliver the runtime safely from source AND from the
 // published tarball — npm pack into scratch, extract, and install both into
 // isolated config dirs that inherit NO ancestor repository node_modules.
@@ -817,19 +1154,22 @@ async function runPackageStage() {
 async function main() {
   const stageIndex = process.argv.indexOf("--stage")
   const stage = stageIndex >= 0 ? process.argv[stageIndex + 1] : "loader"
-  if (!["loader", "v1", "package", "all"].includes(stage)) {
-    process.stderr.write(`Unknown stage: ${stage}. Supported: loader, v1, package, all\n`)
+  if (!["loader", "v1", "package", "delegation", "all"].includes(stage)) {
+    process.stderr.write(`Unknown stage: ${stage}. Supported: loader, v1, delegation, package, all\n`)
     process.exit(2)
   }
 
   const runLoader = stage === "loader" || stage === "all"
   const runV1 = stage === "v1" || stage === "all"
+  const runDelegation = stage === "delegation" || stage === "all"
   const runPackage = stage === "package" || stage === "all"
 
   let loaderResults = []
   let v1Results = []
+  let delegationResults = []
   if (runLoader) loaderResults = await runLoaderStage()
   if (runV1) v1Results = await runV1Stage()
+  if (runDelegation) delegationResults = await runDelegationStage()
   const packageResults = runPackage ? await runPackageStage() : []
 
   // v1-only runs keep the loader-stage host results from the previous report so
@@ -848,6 +1188,7 @@ async function main() {
   const allOk =
     (runLoader ? loaderResults.every((r) => r.ok) : true) &&
     (runV1 ? v1Results.every((r) => r.ok) : true) &&
+    (runDelegation ? delegationResults.every((r) => r.ok) : true) &&
     (runPackage ? packageResults.every((r) => r.ok) : true)
 
   const summary = {
@@ -863,6 +1204,9 @@ async function main() {
     ...(runV1 && !runLoader ? { hostsSource: carriedLoader ? "carried-from-previous-report" : "none" } : {}),
     ...(runV1 ? { v1: v1Results, v1Counts: {
       v1: { ran: runV1, total: v1Results.length, passed: v1Results.filter((r) => r.ok).length },
+    } } : {}),
+    ...(runDelegation ? { delegation: delegationResults, delegationCounts: {
+      delegation: { ran: runDelegation, total: delegationResults.length, passed: delegationResults.filter((r) => r.ok).length },
     } } : {}),
   }
   writeFileSync(paths.report, `${JSON.stringify(summary, null, 2)}\n`)
@@ -880,6 +1224,11 @@ async function main() {
   if (runPackage) {
     for (const r of packageResults) {
       log(`package ${r.ok ? "PASS" : "FAIL"} ${r.case} ${r.ok ? "" : ": " + (r.error ?? (r.problems ?? []).join("; ") ?? r.stderrTail ?? "")}`)
+    }
+  }
+  if (runDelegation) {
+    for (const r of delegationResults) {
+      log(`delegation ${r.ok ? "PASS" : "FAIL"} ${r.host} ${r.case ?? r.error ?? ""} ${r.ok ? "" : "problems: " + (r.problems ?? []).join("; ")}`)
     }
   }
   log(`report: ${paths.report}`)

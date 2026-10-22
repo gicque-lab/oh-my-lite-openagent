@@ -23,6 +23,19 @@ export const REVIEW_SEVERITIES = ["minor", "major"] as const;
 export const REVIEW_SURFACES = ["plan", "result"] as const;
 
 export const MAX_CHILD_ORCHESTRATOR_DEPTH = 1;
+/**
+ * Host session (subagent-nesting) ceiling for the managed default
+ * configuration. Distinct from MAX_CHILD_ORCHESTRATOR_DEPTH (which bounds
+ * plugin-internal child orchestrators): this value is what both host dialects
+ * receive so the deepest existing allowed role chain
+ * command-lead -> deep-plan-builder -> plan-review -> explore (three child
+ * sessions below the entrypoint session, deepest dispatch at depth 2) stays
+ * usable: hosts reject a dispatch when the calling session's ancestry depth is
+ * >= the configured limit (v1: top-level `subagent_depth` config key; v2:
+ * `experimental.subagent_depth`; both default to 1). Never silently raised
+ * over a stricter user setting — a stricter value is kept and reported.
+ */
+export const MAX_HOST_SESSION_DEPTH = 3;
 export const MAX_REVIEW_REVISION_ITERATIONS = 2;
 export const TASK_DAG_MIN_CONCURRENCY = 3;
 export const TASK_DAG_MAX_CONCURRENCY = 5;
@@ -179,6 +192,19 @@ export function getRoleContract(roleName: RoleName): RoleContract {
 
   return contract;
 }
+
+/**
+ * Permitted delegation edges per role, keyed by role name (single source:
+ * ROLE_CONTRACTS.mayDelegateTo). Managed permission.task maps and plugin
+ * delegation guidance must stay in parity with this map; tests lock them
+ * together (tests/config/delegation-parity.test.ts) — no runtime enforcement
+ * is added inside the plugin because permission enforcement is the host's
+ * (host-native allowlists; the plugin never replaces the subagent tool).
+ */
+export const ROLE_DELEGATION_EDGES: Readonly<Record<RoleName, readonly RoleName[]>> =
+  Object.fromEntries(ROLE_CONTRACTS.map((role) => [role.name, role.mayDelegateTo])) as Readonly<
+    Record<RoleName, readonly RoleName[]>
+  >;
 
 export function getPlannerContract(roleName: PlannerRoleName): PlannerContract {
   return PLANNER_CONTRACTS[roleName];

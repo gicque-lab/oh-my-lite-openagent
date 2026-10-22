@@ -153,6 +153,28 @@ export function normalizePluginOptions(
   };
 }
 
+/** Cast used to narrow `fromEntries` output; source data comes from ROLE_CONTRACTS. */
+const delegationEdgesText = ROLE_CONTRACTS.map(
+  (role) => `- ${role.name}${role.mayDelegateTo.length === 0 ? " delegates nothing" : ` -> ${role.mayDelegateTo.join(", ")}`}`,
+).join("\n");
+
+/**
+ * C07 hidden-role supply: v1 registers hidden agents in its own agent catalog
+ * hints, and v2 builds the `subagent` tool description from non-hidden agents
+ * only (live evidence: the host filters `!B.hidden`), so hidden managed roles
+ * are otherwise invisible to the model even though both hosts resolve them by
+ * exact ID. This guidance exposes ONLY allowed delegation edges (allowlist)
+ * inside a plugin tool description — a model-visible channel — without making
+ * roles visible in UI catalogs and without replacing the host subagent tool.
+ * Explicit user deny rules stay the host's decision and always win.
+ */
+export const DELEGATION_GUIDANCE = [
+  "Managed delegation boundaries (host permission rules enforce these edges; explicit user deny rules always win):",
+  delegationEdgesText,
+  "Hidden roles task-lead, explore, librarian, plan-review and result-review are invocable by their exact IDs even when a host catalog omits them; hidden built-in build/plan overrides stay disabled.",
+  "Host session depth (subagent nesting) is configured by the managed installer and is distinct from the plugin child-orchestrator depth cap.",
+].join("\n");
+
 function isRoutingCategory(value: unknown): value is RoutingCategory {
   return (
     value === "execution" ||
@@ -1476,7 +1498,7 @@ export async function createBoundedLiteCore(
     },
     tool: {
       bounded_lite_route: {
-        description: "Resolve a bounded internal routing category to its target role.",
+        description: `Resolve a bounded internal routing category to its target role.\n\n${DELEGATION_GUIDANCE}`,
         args: {
           category: z.string(),
         },
@@ -1578,7 +1600,10 @@ export async function createBoundedLiteCore(
         },
       },
       bounded_lite_background: {
-        description: "List currently tracked background tasks from the bounded coordinator.",
+        // Honesty contract (C07): tracks ONLY the plugin's bounded coordinator,
+        // never host-native background/subagent jobs.
+        description:
+          "List currently tracked background tasks from the bounded coordinator only; host-native background jobs are not tracked.",
         args: {},
         async execute() {
           return formatToolJsonOutput(background.list());

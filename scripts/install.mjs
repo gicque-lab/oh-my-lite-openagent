@@ -11,7 +11,7 @@ import {
   runtimeNpmCacheDir,
   runtimeStagingDir,
 } from "./install-paths.mjs";
-import { MANAGED_CONFIG } from "./managed-config.mjs";
+import { MANAGED_CONFIG, MANAGED_HOST_SESSION_DEPTH } from "./managed-config.mjs";
 
 const PLUGIN_FILE = "bounded-lite.ts";
 const MANAGED_DIRS = ["agents", "plugins", "lib"];
@@ -1145,6 +1145,60 @@ export function nativeManagedPermissionRules(permissionMap) {
   return rules;
 }
 
+/**
+ * C07: host session (subagent-nesting) depth. Both host dialects default to 1
+ * when the key is absent, which blocks the deepest managed chain. Resolution:
+ * - absent -> write the bounded default MANAGED_HOST_SESSION_DEPTH;
+ * - existing >= default (more permissive) -> keep the user value, write nothing;
+ * - existing < default (stricter) -> keep the user value and report a blocker
+ *   naming the exact failing chain and required change (never silently raised).
+ * Reading takes the strictest of both keys, because v1 hosts also accept
+ * `experimental.subagent_depth` (normalized to the top-level key) and a user
+ * could have either form on either dialect.
+ */
+export function resolveHostSessionDepth(existingConfig, isNativeTarget) {
+  const rawValues = [];
+  if (typeof existingConfig?.subagent_depth === "number") rawValues.push(existingConfig.subagent_depth);
+  if (isRecord(existingConfig?.experimental) && typeof existingConfig.experimental.subagent_depth === "number") {
+    rawValues.push(existingConfig.experimental.subagent_depth);
+  }
+  const configured = rawValues.length === 0 ? undefined : Math.min(...rawValues);
+  const writeKey = isNativeTarget ? "experimental" : "top";
+
+  if (configured === undefined) {
+    return { configured: null, effectiveDepth: MANAGED_HOST_SESSION_DEPTH, writeKey, needsWrite: true, blocker: null };
+  }
+  if (configured >= MANAGED_HOST_SESSION_DEPTH) {
+    return { configured, effectiveDepth: configured, writeKey, needsWrite: false, blocker: null };
+  }
+  const keyName = isNativeTarget ? "experimental.subagent_depth" : "subagent_depth";
+  return {
+    configured,
+    effectiveDepth: configured,
+    writeKey,
+    needsWrite: false,
+    blocker: {
+      kind: "host-session-depth-stricter",
+      key: keyName,
+      configured,
+      required: MANAGED_HOST_SESSION_DEPTH,
+      detail:
+        `Existing ${keyName} is ${configured} (stricter than the bounded default ${MANAGED_HOST_SESSION_DEPTH}) and was kept unchanged. ` +
+        `The deepest managed chain fails: command-lead -> deep-plan-builder -> plan-review -> explore is rejected at host session depth ${configured}. ` +
+        `To run the full role chain, set ${keyName} to ${MANAGED_HOST_SESSION_DEPTH} or higher (plugin child-orchestrator depth stays 1 regardless).`,
+    },
+  };
+}
+
+function applyHostSessionDepthWrite(depthInfo) {
+  if (!depthInfo.needsWrite) return {};
+  return {
+    subagent_depth: depthInfo.writeKey === "top" ? MANAGED_HOST_SESSION_DEPTH : undefined,
+    experimental: depthInfo.writeKey === "top" ? undefined : { subagent_depth: MANAGED_HOST_SESSION_DEPTH },
+  };
+}
+
+
 function relativePluginOptions(configDir, taskLeadProfiles) {
   return {
     mode: "full",
@@ -1461,6 +1515,11 @@ function mergeConfig(existingConfig, sourceConfig, configDir, options = {}) {
 
   const mcpOutput = mergeMcpDialectAware(existingConfig, sourceConfig, options.managedMcp, isNativeTarget);
 
+  // C07: bounded default host session depth, dialect-aware, written only when
+  // the user has no existing depth setting and never over a stricter value.
+  const hostSessionDepth = resolveHostSessionDepth(existingConfig, isNativeTarget);
+  const depthWrite = applyHostSessionDepthWrite(hostSessionDepth);
+
   const {
     taskLeadProfiles: _legacyTaskLeadProfiles,
     agent: _existingAgents,
@@ -1485,6 +1544,10 @@ function mergeConfig(existingConfig, sourceConfig, configDir, options = {}) {
     default_agent: sourceConfig.default_agent,
     ...(permissionOutput !== undefined ? { permission: permissionOutput } : {}),
     ...(permissionsOutput !== undefined ? { permissions: permissionsOutput } : {}),
+    ...(depthWrite.subagent_depth !== undefined ? { subagent_depth: depthWrite.subagent_depth } : {}),
+    ...(depthWrite.experimental !== undefined
+      ? { experimental: { ...preservedExisting.experimental, ...depthWrite.experimental } }
+      : {}),
     ...(Object.keys(customLegacyAgents).length > 0 ? { agent: customLegacyAgents } : {}),
     ...(nativeAgents !== undefined ? { agents: nativeAgents } : {}),
   };
@@ -2048,10 +2111,19 @@ function mergeAll(context) {
     managedMcp: context.managedMcp,
     specialistNames: new Set(Object.keys(liteConfig.specialists ?? {})),
   });
+  // Same pure decision mergeConfig applied; surfaced here for the install
+  // report so a stricter user depth limit is a reported blocker, never a
+  // silent rewrite.
+  const dialectInfo = detectConfigDialect(context.existingConfig);
+  const hostSessionDepth = resolveHostSessionDepth(
+    context.existingConfig,
+    dialectInfo.dialect === "native" || dialectInfo.dialect === "mixed",
+  );
 
   return {
     liteConfig,
     mergedConfig: injectInstallScopedCommands(mergedConfig, context),
+    hostSessionDepth,
   };
 }
 
@@ -2122,6 +2194,12 @@ export async function install(options = {}) {
     throw new Error(formatInstallConflicts(conflicts));
   }
 
+  // C07: a stricter user-configured host session depth is kept and reported
+  // (not silently raised); the install itself still proceeds.
+  if (merged.hostSessionDepth?.blocker) {
+    context.report.hostSessionDepthBlocker = merged.hostSessionDepth.blocker;
+  }
+
   const inspection = await inspectManagedRuntimeNamespace(context);
   context.report.runtimeNamespaceExisted = inspection.exists;
 
@@ -2187,6 +2265,11 @@ async function main() {
     console.log("");
     console.log("Planned install actions (dry run — nothing written, nothing installed):");
     for (const step of result.report.plan) console.log(`  - ${step}`);
+  }
+
+  if (result.report?.hostSessionDepthBlocker) {
+    console.log("");
+    console.log("WARN: " + result.report.hostSessionDepthBlocker.detail);
   }
 
   if (args.interactive) {
