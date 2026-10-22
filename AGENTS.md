@@ -25,7 +25,7 @@
 - Plan artifacts are written by default to the project's `.liteagent/plans/` directory, indexed at `.liteagent/plan-index.jsonl`. Do not write user plans into `.opencode/`.
 
 ## Installer and Configuration Merging Rules
-- `scripts/install.mjs` only manages and copies `.opencode/{agents,plugins,lib}` to the target OpenCode configuration directory.
+- `scripts/install.mjs` only manages the copied `.opencode/{agents,plugins,lib}` tree plus the dedicated managed runtime namespace `<config-dir>/.opencode/oh-my-lite-openagent/` (the `server.ts` shim with its own package manifest/lock and installed dependencies) in the target OpenCode configuration directory.
 - The installer overwrites/writes plugin entries and agent definitions managed by this repository, but preserves existing user providers, models, API keys, other plugins, and custom configurations. Do not break this when modifying merging logic.
 - Before writing to user OpenCode configuration, a backup is created in the same directory (e.g. `opencode.json.bak` or `opencode.jsonc.bak`). Model configuration writebacks in the plugin also create backups first.
 - OpenCode configuration directory priority: `OPENCODE_CONFIG_DIR` > `--config-dir` > platform default directory.

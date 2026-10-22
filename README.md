@@ -40,6 +40,7 @@ The AI installation guide lives in [`AI-INSTALL.md`](./AI-INSTALL.md).
 ## Documentation
 
 - [`docs/SPECIALIST_AGENTS_AND_REASONING.md`](./docs/SPECIALIST_AGENTS_AND_REASONING.md) — configure specialist agents, directory-scoped permissions, models, and reasoning effort.
+- [`docs/opencode-compatibility.md`](./docs/opencode-compatibility.md) — v1/v2 compatibility boundaries, plan-tool payload contract, and restart/recovery instructions.
 - [`AI-INSTALL.md`](./AI-INSTALL.md) — AI-assisted installation and `/agent-models` workflow.
 - [`docs/ARCHITECTURE_OVERVIEW.md`](./docs/ARCHITECTURE_OVERVIEW.md) — fixed role topology, delegation, and runtime architecture.
 - [`docs/ARCHITECTURE_FLOW.md`](./docs/ARCHITECTURE_FLOW.md) — orchestration flow diagrams and lifecycle details.
@@ -113,13 +114,19 @@ agents/*.md
 oh-my-lite-openagent.json
 ```
 
+Plus a dedicated managed runtime namespace at `<configDir>/.opencode/oh-my-lite-openagent/` containing the `server.ts` shim with its own package manifest, lockfile, and installed dependencies.
+
 Then it merges only the plugin/command/MCP bootstrap fragment from `scripts/managed-config.mjs` into the OpenCode global config. Role definitions are generated as OpenCode markdown agents under `<configDir>/agents/*.md`; role model and reasoning settings live in `<configDir>/oh-my-lite-openagent.json`. The installer removes stale managed role definitions from `opencode.json` so the global config and markdown agent files do not carry two copies of the same managed roles; custom agents are preserved. The package no longer ships a root `opencode.json`; provider, API key, unrelated plugin, MCP, and custom agent settings belong to the user's own OpenCode config. If the target config directory only has `opencode.jsonc`, the installer reads and writes `opencode.jsonc` and does not create an extra `opencode.json`; if both `opencode.json` and `opencode.jsonc` exist, `opencode.json` is treated as the active merge target.
 
 By default, the installer backfills zero-secret managed MCP servers for `context7` (`npx -y @upstash/context7-mcp`) and `playwright` (`npx -y @playwright/mcp`). Existing user MCP servers are preserved, and an existing user-defined `context7` or `playwright` entry wins over the managed default. To skip these managed MCP defaults, run `npm run install:opencode -- --no-managed-mcp` or `node scripts/install.mjs --no-managed-mcp`.
 
 Generated `<configDir>/agents/*.md` files are managed outputs. Do not hand-edit them for durable preferences; use `/agent-models`, OpenCode configuration, or rerun the installer so regeneration keeps the intended state.
 
-The installer writes `.bak` backups only for target files that already exist, such as an existing `opencode.json`/`opencode.jsonc` or existing `<configDir>/agents/*.md`; first-time files do not get empty backups.
+The installer writes `.bak` backups only for target files that already exist, such as an existing `opencode.json`/`opencode.jsonc` or existing `<configDir>/agents/*.md`; first-time files do not get empty backups. If a real run fails partway, the write journal rolls back its changes so the previous install keeps working.
+
+v1 and v2 share the same config locations, and native-v2 config files must not be reused by a v1 host.
+
+After installing or changing config-time state, restart so the new files load: on v1, exit and relaunch the `opencode` process; on v2, restart the OpenCode service/plugin runtime. Starting a new conversation is not enough. For the full compatibility boundaries, see [`docs/opencode-compatibility.md`](./docs/opencode-compatibility.md).
 
 Managed command-line permissions are intentionally permissive for the eight real roles: bash defaults to `allow`, and only dangerous or sensitive commands ask for confirmation. Examples include destructive file operations, system privilege/permission commands, commands that modify git history or remotes, npm publish/remove/version commands, installer commands that actually write OpenCode global config, and pipe/eval forms that execute downloaded content. This bash policy lives in global `permission.bash`; if the user already has a custom `permission` object but no `bash` entry, the installer backfills the managed bash policy while preserving the user's other permission settings. If the user has explicitly configured `permission.bash`, the installer preserves it. The disabled OpenCode built-in `build` and `plan` overrides remain fully denied.
 
@@ -406,7 +413,7 @@ npm run install:opencode
 
 - Linux: verified.
 - Windows: designed for `%APPDATA%\opencode`, but not yet verified on a real Windows machine in this repository.
-- OpenCode version tested in this environment: `1.4.6`.
+- OpenCode compatibility: minimum v1 `1.18.29`; real-host verified on v1.18.29, v1.19.1, and v2.0.30. See [`docs/opencode-compatibility.md`](./docs/opencode-compatibility.md) for the supported boundary matrix and recovery instructions.
 
 ## Design Rules
 

@@ -131,12 +131,20 @@ Workflow:
    git -C "__OH_MY_LITE_SOURCE_ROOT__" pull --ff-only
 2. Then run exactly:
    node "__OH_MY_LITE_SOURCE_ROOT__/scripts/install.mjs" --root-dir "__OH_MY_LITE_SOURCE_ROOT__" --config-dir "__OH_MY_LITE_CONFIG_DIR__"
-3. Report the install output and remind the user to restart OpenCode.
+3. Report the install output and remind the user to restart OpenCode so the updated files load: on v1, exit and relaunch the opencode process; on v2, restart the OpenCode service/plugin runtime. Starting a new conversation is not enough.
 
 Safety boundaries:
 - Do not commit, push, force-pull, reset, clean, or edit user config manually.
 - Do not run npm install, npm update, or arbitrary shell commands unless the user explicitly asks.
 - If the source repository path does not exist, stop and report the missing path.`;
+
+// C07: bounded default host session (subagent-nesting) depth. Not part of the
+// merged fragment below — the installer serializes the dialect-appropriate key
+// (v1: top-level `subagent_depth`, v2: `experimental.subagent_depth`), only
+// when the user has not already configured a value, and never raises a
+// stricter existing setting. Mirrors .opencode/lib/contracts.ts
+// MAX_HOST_SESSION_DEPTH; tests lock the two together.
+export const MANAGED_HOST_SESSION_DEPTH = 3;
 
 export const MANAGED_CONFIG = {
   "$schema": "https://opencode.ai/config.json",

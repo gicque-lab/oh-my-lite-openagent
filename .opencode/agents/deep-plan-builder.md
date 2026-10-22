@@ -149,7 +149,7 @@ task_details:
 
 ## Executable Core
 
-Treat `.opencode/lib/artifacts/schema.ts` as the authoritative plan schema. Emit a plan file whose executable core contains at minimum:
+Treat `.opencode/lib/artifacts/schema.ts` as the authoritative entrypoint for the plan payload contract (artifact kinds/lifecycle plus the executable payload schemas). Emit a plan file whose executable core contains at minimum:
 
 ```yaml
 plan:
@@ -162,6 +162,8 @@ plan:
 ```
 
 `depends_on` is required even when empty. `attributes` is a tag set used for configured Task Lead profile dispatch by Command Lead; use capability tags like `quick`, `code`, `research`, `docs`, `writing`, `multimodal`, `visual`, `deep`, `large-context`, `risk-high`, `security`, or `migration` rather than model names.
+
+Alongside the human-readable Markdown, every generated plan must provide a clearly labeled fenced `json plan-payload` block containing one JSON validation object: the complete payload value to submit as the named `payload` argument of `bounded_lite_plan_readiness` / `bounded_lite_plan_dag` (never a raw Markdown document or a JSON-encoded string). Include `plan_review`, `open_questions`, and `self_check` information when present, not only a subtasks summary — subtasks-only objects can hide blockers.
 
 ## Final Self-Check
 

@@ -18,6 +18,10 @@ After installation, the user should be able to run `opencode` from any directory
 
 This repository does not ship a root `opencode.json`. The installer merges only the plugin-managed config fragment from `scripts/managed-config.mjs`; user-specific provider, model, API key, unrelated plugin, and custom agent settings must remain in the user's own OpenCode config. Managed role definitions are generated as markdown files under `<configDir>/agents/*.md`; stale managed role definitions are removed from `opencode.json`, while custom agents are preserved.
 
+The installer also writes a private managed runtime namespace at `<configDir>/.opencode/oh-my-lite-openagent/` (`server.ts` shim with its own package manifest/lock and dependencies installed into that namespace only). It makes no global user-manifest changes. Run `node scripts/install.mjs --dry-run` first to preview every planned action without writing anything. If a dependency install fails offline, installation stops before activation with the exact npm error and the previous runtime/config are kept intact; fix the environment and retry explicitly. If a real install fails partway, the write journal rolls back the changes so the previous install keeps working.
+
+After installation succeeds, the user must restart OpenCode so the new files load: on v1, exit and relaunch the `opencode` process; on v2, restart the OpenCode service/plugin runtime. Starting a new conversation is not enough. v1 and v2 share config locations, and native-v2 config must not be reused by v1.
+
 If installing from npm or `npx`, warn the user that the downloaded npm package may lag behind the latest repository `main` branch. For the newest documented behavior, prefer the source install below or confirm the published version with `npm view oh-my-lite-openagent version`.
 
 Before running the installer, do this preflight check in the target OpenCode config directory:

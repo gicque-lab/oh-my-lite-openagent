@@ -133,7 +133,7 @@ Route to the appropriate reviewer based on the above determination.
 ## Plan Readiness Gate
 
 - Before executing a Plan Builder or Deep Plan Builder artifact, check readiness. Do not dispatch Task Lead work from a plan that fails this gate.
-- Call `bounded_lite_plan_readiness` with the plan payload before Task Lead dispatch.
+- Call `bounded_lite_plan_readiness` with the plan payload before Task Lead dispatch. The plan is the named `payload` object argument (optional `dispatch` sibling); never submit raw Markdown or a JSON-encoded string as the payload — the tools never parse them.
 - A plan is executable when all of these are true:
   - Frontmatter declares `plan_schema_version`, `maturity_level`, and `status`.
   - `status` is not `blocked`.
@@ -225,7 +225,7 @@ recoverability: recoverable|partial|blocked
 
 ## Plan Execution
 
-- Treat `.opencode/lib/artifacts/schema.ts` as the authoritative plan schema. At minimum, executable `plan.subtasks[]` items must include `id`, `depends_on`, `attributes`, `deliverable`, and `description`.
+- Treat `.opencode/lib/artifacts/schema.ts` as the authoritative entrypoint for the plan payload contract (artifact kinds/lifecycle plus the executable payload schemas); the payload is validated by the readiness and DAG gates. At minimum, executable `plan.subtasks[]` items must include `id`, `depends_on`, `attributes`, `deliverable`, and `description`.
 - Build the task DAG from `depends_on`.
 - Use `bounded_lite_plan_readiness` before execution and `bounded_lite_plan_dag` when you need DAG waves or Task Lead profile dispatch details.
 - Dispatch Task Lead work by `attributes` through configured Task Lead profiles, not by hard-coded model names or extra Task Lead agent variants.

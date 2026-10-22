@@ -106,6 +106,8 @@ describe("OpenCode agent topology", () => {
     expect(config.command?.["update-lite"]?.template).toContain("--root-dir");
     expect(config.command?.["update-lite"]?.template).toContain("--config-dir");
     expect(config.command?.["update-lite"]?.template).toContain("restart OpenCode");
+    expect(config.command?.["update-lite"]?.template).toContain("opencode process");
+    expect(config.command?.["update-lite"]?.template).toContain("service/plugin runtime");
     expect(config.command?.["update-lite"]?.template).toContain("Do not commit, push");
   });
 
@@ -287,6 +289,8 @@ describe("OpenCode agent topology", () => {
     expect(promptText).toContain("M3");
     expect(promptText).toContain("M2");
     expect(promptText).toContain("bounded_lite_plan_readiness");
+    expect(promptText).toContain("named `payload` object argument");
+    expect(promptText).toContain("never submit raw Markdown or a JSON-encoded string as the payload");
     expect(promptText).toContain("no unresolved major Plan Review finding");
     expect(promptText).toContain("do not fill missing product, compatibility, architecture, or acceptance decisions yourself");
     expect(promptText).toContain("ask the user whether to escalate to Deep Plan Builder");
@@ -385,6 +389,10 @@ describe("OpenCode agent topology", () => {
     expect(promptText).toContain("Deleting plan artifact files or removing/changing index entries is allowed only when the user explicitly asks");
     expect(promptText).toContain("does not grant execution dispatch, final approval, or canonical state advancement authority");
     expect(promptText).toContain("recommended_next_step: deep_plan_builder");
+    expect(promptText).toContain("authoritative entrypoint for the plan payload contract");
+    expect(promptText).toContain("json plan-payload");
+    expect(promptText).toContain("named `payload` argument");
+    expect(promptText).toContain("not only a subtasks summary");
     expect(promptText).toContain("## Decision Selector Discipline");
     expect(promptText).toContain("Question tool");
     expect(promptText).toContain("technology stack");
@@ -404,6 +412,10 @@ describe("OpenCode agent topology", () => {
     expect(config.agent["deep-plan-builder"]?.permission?.edit).toMatchObject({
       ".liteagent/**": "allow",
     });
+    expect(promptText).toContain("authoritative entrypoint for the plan payload contract");
+    expect(promptText).toContain("json plan-payload");
+    expect(promptText).toContain("named `payload` argument");
+    expect(promptText).toContain("not only a subtasks summary");
     expect(promptText).toContain("Direct plan persistence does not grant execution dispatch, final approval, or canonical state advancement authority");
     expect(promptText).toContain("## Decision Selector Discipline");
     expect(promptText).toContain("Question tool");
