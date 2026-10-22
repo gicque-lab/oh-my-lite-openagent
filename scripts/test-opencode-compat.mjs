@@ -6,7 +6,7 @@
 // logs) inside .liteagent/scratch/opencode-compat/. Hosts are never put on PATH.
 //
 // Usage:
-//   node scripts/test-opencode-compat.mjs [--stage loader|v1|all]
+//   node scripts/test-opencode-compat.mjs [--stage loader|v1|matrix|delegation|package|all]
 //
 // Stages:
 //   loader (default)
@@ -38,7 +38,26 @@
 //            deepest chain with the host depth error), and hidden roles staying
 //            absent from the host-built task/subagent tool description while
 //            still resolving by ID.
-//   all      loader + v1 + delegation + package.
+//   matrix   C09 real-plugin host/config matrix gate over all five mandatory
+//            host/config combinations (v1.18.29+legacy, v1.19.1+legacy,
+//            v2.0.30+legacy, v2.0.30+native, v2.0.30+mixed): the REAL
+//            bounded-lite plugin (same staging layout as the v1 stage) is
+//            configured in the case's dialect and driven through the scripted
+//            provider. Proves per case: exactly nine bounded_lite_* tools on
+//            the provider surface, provider-visible plan-tool JSON Schemas
+//            captured from the live request payload, the documented
+//            structured plan object passing bounded_lite_plan_readiness
+//            (executable true) and bounded_lite_plan_dag (bounded waves)
+//            through real host execution, one actionable diagnostic for each
+//            mandatory format negative on v1 (for v2 the double-encoded
+//            negative is replaced by a pinned-literal behavior tripwire, see
+//            the pin block in runMatrixStage), and the corresponding semantic
+//            gates
+//            (blocked/M0/M1 status, blocking open question, unresolved major
+//            plan-review finding, self-check blocker, duplicate id, unknown
+//            dependency, cyclic depends_on, bad dispatch option) rejecting
+//            without any write.
+//   all      loader + matrix + delegation + package.
 //   package  C06 delivery gate: npm pack into scratch + extract; install BOTH
 //            (a) from this source checkout and (b) from the extracted tarball
 //            into isolated config dirs with no ancestor repo node_modules.
@@ -55,7 +74,18 @@
 // postinstall.mjs is executed manually with the isolated environment instead.
 import { spawn, spawnSync } from "node:child_process"
 import { createRequire } from "node:module"
-import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
+import {
+  copyFileSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs"
+import { createHash } from "node:crypto"
 import { dirname, join, resolve } from "node:path"
 
 const require = createRequire(import.meta.url)
@@ -667,6 +697,449 @@ async function runV1Stage() {
 }
 
 // ---------------------------------------------------------------------------
+// C09 matrix stage: the REAL bounded-lite plugin on every mandatory
+// host/config combination. Each case stages the real plugin exactly like the
+// v1 stage into an isolated per-case project and drives one deterministic
+// scripted-provider sequence (per-session transcript cursor): valid readiness
+// + DAG calls, then the mandatory format and semantic negatives. Tool
+// Tool schemas are captured from the provider request log — the actual
+// provider payload, not registry source shapes.
+// ---------------------------------------------------------------------------
+const MATRIX_CASES = [
+  { key: "v1.18.29-legacy", hostId: "opencode-v1.18.29", dialect: "legacy" },
+  { key: "v1.19.1-legacy", hostId: "opencode-v1.19.1", dialect: "legacy" },
+  { key: "v2.0.30-legacy", hostId: "opencode-v2.0.30", dialect: "legacy" },
+  { key: "v2.0.30-native", hostId: "opencode-v2.0.30", dialect: "native" },
+  { key: "v2.0.30-mixed", hostId: "opencode-v2.0.30", dialect: "mixed" },
+]
+
+const MATRIX_PROJECT_ROOT = join(SCROOT, "project-matrix")
+const MATRIX_FINAL_TEXT = V1_FINAL_TEXT
+
+// Expected on-host rejection marker for every scripted negative step (indexes
+// match buildMatrixScript order). Actionable rejection can arrive at either
+// boundary: the shared runtime format diagnostics (v1 hosts pass strings
+// through) or the host's own argument-validation diagnostics (v2 hosts
+// pre-validate registered schemas and name the key).
+//
+// Behavior pin / tripwire (C09, user decision 2026-10-22): per-host
+// expectations for step 4 (double-encoded JSON string) are pinned
+// intentionally — v1 hosts keep the strict shared "double-encoded" runtime
+// diagnostic below, while a v2 case replaces it with the literal host-coercion
+// assertion block in runMatrixStage. If any future host stops coercing (a v2
+// string arrives raw -> rejection) or a v1 host starts coercing, the stage
+// fails so CI flags the behavior change. Verified verbatim from host evidence
+// (.liteagent/scratch/opencode-compat/evidence/matrix-*/), not assumed.
+const MATRIX_STEP_EXPECTATIONS = {
+  2: /Missing `payload`|payload: Missing key/,
+  3: /raw Markdown document|payload: Expected object/,
+  4: /JSON-encoded string|double-encoded/,
+  5: /not an array/,
+  6: /payload\.plan must be an object/,
+  7: /blocked plans are not executable\./,
+  8: /M0 plans are not executable\./,
+  9: /M1 plans are not executable\./,
+  10: /M2 plan has open_questions that block the current phase\./,
+  11: /plan has an unresolved major Plan Review finding\./,
+  12: /plan self-check reports a blocker\./,
+  13: /id duplicates \S+/,
+  14: /depends on unknown subtask/,
+  15: /cycl/i,
+  16: /concurrency must be an integer from 3 to 5/,
+}
+// Host argument-validation diagnostics (schema-level, no structured example)
+// are accepted alongside the runtime diagnostics with their expected key/type
+// phrasing; markers 5/6 additionally match them via their host phrasing below.
+const HOST_ARGUMENT_REJECTIONS = {
+  5: /payload: Expected object/,
+  6: /payload\.plan: Missing key/,
+}
+const MATRIX_NEGATIVE_START = 2
+
+// Human labels for the report bullets, one per scripted negative step.
+const MATRIX_STEP_LABELS = {
+  2: "missing payload (no `payload` argument)",
+  3: "raw Markdown string payload",
+  4: "double-encoded JSON string payload",
+  5: "array payload",
+  6: "extra wrapper payload",
+  7: "blocked status plan",
+  8: "M0 maturity plan",
+  9: "M1 maturity plan",
+  10: "blocking M2 open question",
+  11: "unresolved major plan-review finding",
+  12: "self-check blocker",
+  13: "duplicate subtask id",
+  14: "unknown dependency",
+  15: "cyclic depends_on",
+  16: "bad dispatch option (concurrency out of 3-5)",
+}
+
+function sha256File(path) {
+  return createHash("sha256").update(readFileSync(path)).digest("hex")
+}
+
+// Reuse the C03 real-plugin staging verbatim; one staged layout serves both
+// host lines because the v2 host supplies @opencode/plugin itself
+// (tests/fixtures/opencode-compat/server.ts semantics) and @opencode-ai/plugin
+// plus zod are installed into the plugin's own directory.
+function stageRealPluginFixture(host) {
+  // ponytail: rebuild the fixture per host once per run; warm npm cache keeps this cheap
+  return stageV1Fixture(host)
+}
+
+// Dialect mapping (plan C09): legacy = v1 `plugin` key; native = v2
+// `plugins` key; mixed = BOTH top-level keys naming the same real plugin.
+// The v2 host discovers .opencode dirs in every ancestor, and the checkout's
+// own production bounded-lite.ts sits in such an ancestor, so every v2 matrix
+// project explicitly suppresses it via the native `-` removal entry — the
+// positive entry always goes through the case's dialect key. Native-v2 config
+// is intentionally never fed to the v1 hosts.
+function writeMatrixProjectConfig(host, matrixCase, fixtureDir, providerPort) {
+  const projectDir = join(MATRIX_PROJECT_ROOT, matrixCase.key)
+  rmSync(projectDir, { recursive: true, force: true })
+  mkdirSync(projectDir, { recursive: true })
+  spawnSync("git", ["init", "-q", projectDir])
+  const config = {
+    $schema: "https://opencode.ai/config.json",
+    provider: {
+      scripted: {
+        npm: "@ai-sdk/openai-compatible",
+        name: "Scripted",
+        options: { baseURL: `http://127.0.0.1:${providerPort}/v1` },
+        models: { "echo-model": { name: "Echo Model", tool_call: true } },
+      },
+    },
+    small_model: "scripted/echo-model",
+  }
+  const prodPluginPath = join(REPO_ROOT, ".opencode", "plugins", "bounded-lite.ts")
+  if (matrixCase.dialect === "legacy" || matrixCase.dialect === "mixed") {
+    config.plugin = [fixtureDir]
+  }
+  if (matrixCase.dialect === "native" || matrixCase.dialect === "mixed") {
+    config.plugins = [{ package: fixtureDir }, `-` + prodPluginPath]
+  } else if (host.line === "v2") {
+    // v2 + legacy-positive case still needs the ancestor production plugin
+    // suppressed; the native `plugins` key is the only defined removal channel.
+    config.plugins = [`-` + prodPluginPath]
+  }
+  writeFileSync(join(projectDir, "opencode.json"), `${JSON.stringify(config, null, 2)}\n`)
+  return projectDir
+}
+
+// 18-step deterministic script (step index = call_scripted_N):
+//   0  documented structured plan object -> bounded_lite_plan_readiness
+//   1  valid single-subtask payload      -> bounded_lite_plan_dag
+//   2-6  format negatives (missing payload / raw Markdown / double-encoded
+//        JSON string / array / extra wrapper) on bounded_lite_plan_dag
+//   7-12 semantic readiness negatives (blocked / M0 / M1 / blocking open
+//        question / unresolved major finding / self-check blocker) on
+//        bounded_lite_plan_readiness
+//   13-15 semantic DAG negatives (duplicate id / unknown dependency / cyclic
+//        depends_on) on bounded_lite_plan_dag
+//   16 bad dispatch option (concurrency out of the 3-5 architecture bounds)
+//   17 equivalent object DAG call of the SAME documented fixture — the live
+//        reference the v2 double-encoded behavior pin compares its results
+//        against (completes through real host execution on every case)
+function buildMatrixScript() {
+  const fixture = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "plans", "structured-plan.json"), "utf8"))
+  const minimal = (id, dependsOn = []) => ({
+    id,
+    depends_on: dependsOn,
+    attributes: ["code"],
+    deliverable: `Matrix probe ${id}`,
+    description: `Matrix probe subtask ${id} generated by the compat runner.`,
+  })
+  const semanticBase = (patch) => ({ ...fixture, ...patch })
+  return [
+    { tool: "bounded_lite_plan_readiness", arguments: { payload: fixture } },
+    { tool: "bounded_lite_plan_dag", arguments: { payload: { plan: { subtasks: [minimal("MX1")] } } } },
+    { tool: "bounded_lite_plan_dag", arguments: {} },
+    { tool: "bounded_lite_plan_dag", arguments: { payload: "---\ntitle: Not An Object\n---\n\n# Raw Markdown Submission\n\n## goals\n- must be rejected as a format error\n" } },
+    { tool: "bounded_lite_plan_dag", arguments: { payload: JSON.stringify(fixture) } },
+    { tool: "bounded_lite_plan_dag", arguments: { payload: [fixture] } },
+    { tool: "bounded_lite_plan_dag", arguments: { payload: { extraWrapper: { plan: { subtasks: [minimal("W1")] } } } } },
+    { tool: "bounded_lite_plan_readiness", arguments: { payload: semanticBase({ status: "blocked" }) } },
+    { tool: "bounded_lite_plan_readiness", arguments: { payload: semanticBase({ maturity_level: "M0" }) } },
+    { tool: "bounded_lite_plan_readiness", arguments: { payload: semanticBase({ maturity_level: "M1" }) } },
+    { tool: "bounded_lite_plan_readiness", arguments: { payload: semanticBase({ maturity_level: "M2", open_questions: [{ question: "[Open Question] Which compatibility policy applies?", blocks_current_phase: true }] }) } },
+    {
+      tool: "bounded_lite_plan_readiness",
+      arguments: {
+        payload: semanticBase({ plan_review: { decision: "fail", findings: [{ location: "plan", issue: "gap", severity: "major", resolved: false }] } }),
+      },
+    },
+    { tool: "bounded_lite_plan_readiness", arguments: { payload: semanticBase({ self_check: { passed: false, blocked: true } }) } },
+    { tool: "bounded_lite_plan_dag", arguments: { payload: { plan: { subtasks: [minimal("DUP"), minimal("DUP")] } } } },
+    {
+      tool: "bounded_lite_plan_dag",
+      arguments: { payload: { plan: { subtasks: [minimal("UN1", ["ghost"])] } } },
+    },
+    {
+      tool: "bounded_lite_plan_dag",
+      arguments: {
+        payload: { plan: { subtasks: [minimal("CYA", ["CYB"]), minimal("CYB", ["CYA"])] } },
+      },
+    },
+    { tool: "bounded_lite_plan_dag", arguments: { payload: { plan: { subtasks: [minimal("DT1")] } }, dispatch: { concurrency: 2 } } },
+    // Equivalent object call of the SAME documented fixture, appended late in
+    // the transcript so the double-encoded pin compares sibling live results.
+    { tool: "bounded_lite_plan_dag", arguments: { payload: fixture } },
+  ]
+}
+
+// Last non-empty tools array from the request log — the provider-visible
+// surface as the host actually sent it. The point capture file is overwritten
+// per request, so it alone can miss the fully tooled requests.
+function readProviderTools(requestLog) {
+  let tools = []
+  try {
+    for (const line of readFileSync(requestLog, "utf8").trim().split("\n").filter(Boolean)) {
+      try {
+        const saw = JSON.parse(line)?.body?.tools
+        if (Array.isArray(saw) && saw.length > 0) tools = saw
+      } catch {}
+    }
+  } catch {}
+  return tools
+}
+
+function toolFunctionSchema(tools, name) {
+  const tool = tools.find((t) => t?.function?.name === name)
+  return tool?.function?.parameters ?? tool?.function?.input_schema ?? null
+}
+
+async function runMatrixStage() {
+  ensureDirs()
+  mkdirSync(MATRIX_PROJECT_ROOT, { recursive: true })
+  const results = []
+
+  for (const matrixCase of MATRIX_CASES) {
+    const host = HOSTS.find((h) => h.id === matrixCase.hostId)
+    const problems = []
+    const evidenceDir = join(paths.evidence, `matrix-${matrixCase.key}`)
+    rmSync(evidenceDir, { recursive: true, force: true })
+    mkdirSync(evidenceDir, { recursive: true })
+
+    let bin, version, fixtureDir
+    try {
+      bin = stageHost(host)
+      version = hostVersion(bin)
+      fixtureDir = stageV1Fixture(host)
+    } catch (error) {
+      // A missing/unavailable host or fixture is BLOCKED, never passed.
+      results.push({ host: host.id, key: matrixCase.key, dialect: matrixCase.dialect, stage: "matrix", ok: false, status: "blocked", error: String(error.message ?? error), evidenceDir })
+      continue
+    }
+    log(`matrix ${matrixCase.key}: staged ${bin} (${version}), plugin fixture ${fixtureDir}`)
+
+    const requestLog = join(evidenceDir, "provider-requests.jsonl")
+    writeFileSync(join(evidenceDir, "matrix-script.json"), `${JSON.stringify(buildMatrixScript(), null, 2)}\n`)
+
+    const { child: provider, port } = await startProvider(
+      0,
+      join(evidenceDir, "provider-capture.json"),
+      join(evidenceDir, "matrix-script.json"),
+      requestLog,
+    )
+    let runRes, projectDir
+    try {
+      projectDir = writeMatrixProjectConfig(host, matrixCase, fixtureDir, port)
+      runRes = runHost(host, bin, projectDir, evidenceDir, 420_000, {
+        prompt: "Execute the scripted tool calls exactly as they arrive, in order. Do not improvise other calls.",
+        logPrefix: `matrix-${matrixCase.key}`,
+      })
+    } finally {
+      provider.kill()
+    }
+
+    // Provider-visible tool surface from the live payloads.
+    const providerTools = readProviderTools(requestLog)
+    const providerToolNames = providerTools.map((t) => t?.function?.name).filter(Boolean)
+    const boundedNames = providerToolNames.filter((n) => n.startsWith("bounded_lite_"))
+    const uniqueBounded = [...new Set(boundedNames)]
+    const REQUIRED_BOUNDED_TOOLS = [
+      "bounded_lite_background",
+      "bounded_lite_model_config",
+      "bounded_lite_plan_artifact",
+      "bounded_lite_plan_dag",
+      "bounded_lite_plan_readiness",
+      "bounded_lite_route",
+      "bounded_lite_runtime_profile",
+      "bounded_lite_study_ingest",
+      "bounded_lite_study_package",
+    ]
+    uniqueBounded.sort()
+    for (const required of REQUIRED_BOUNDED_TOOLS) {
+      assert(uniqueBounded.includes(required), `bounded_lite tool ${required} not visible on the provider surface`, problems)
+    }
+    assert(boundedNames.length === 9, `expected exactly 9 bounded_lite_* tools visible, got ${boundedNames.length} (${boundedNames.join(", ")})`, problems)
+
+    // Capture the provider-visible plan-tool JSON Schemas (C09 :634).
+    const schemaCapture = {
+      host: host.id,
+      hostVersion: version,
+      caseKey: matrixCase.key,
+      dialect: matrixCase.dialect,
+      providerToolNames,
+      toolSchemas: {
+        bounded_lite_plan_dag: toolFunctionSchema(providerTools, "bounded_lite_plan_dag"),
+        bounded_lite_plan_readiness: toolFunctionSchema(providerTools, "bounded_lite_plan_readiness"),
+      },
+    }
+    assert(Boolean(schemaCapture.toolSchemas.bounded_lite_plan_dag), "no provider-visible JSON schema captured for bounded_lite_plan_dag", problems)
+    assert(Boolean(schemaCapture.toolSchemas.bounded_lite_plan_readiness), "no provider-visible JSON schema captured for bounded_lite_plan_readiness", problems)
+    for (const [tool, schema] of Object.entries(schemaCapture.toolSchemas)) {
+      if (schema) {
+        assert(
+          schema.type === "object" && Boolean(schema.properties?.payload) && Boolean(schema.properties?.dispatch),
+          `${tool} provider schema lost the expected payload/dispatch shape`,
+          problems,
+        )
+      }
+    }
+    writeFileSync(join(evidenceDir, "plan-tool-schemas.json"), `${JSON.stringify(schemaCapture, null, 2)}\n`)
+
+    // Deterministic round trip: extract real tool results from the request log.
+    const toolResults = readToolResults(requestLog)
+    const resultFor = (index) => toolResults.find((r) => r.callID === `call_scripted_${index}`) ?? null
+
+    // (a) valid readiness: fixture passes with executable true.
+    const readinessResult = resultFor(0)
+    assert(Boolean(readinessResult), "structured plan_readiness call produced no tool result", problems)
+    let readinessOk = false
+    try {
+      readinessOk = readinessResult !== null && JSON.parse(readinessResult.content).executable === true
+    } catch {}
+    assert(readinessOk, `valid structured payload did not pass readiness with executable true: ${readinessResult?.content?.slice(0, 300) ?? "no result"}`, problems)
+
+    // (b) valid DAG: bounded waves containing the scripted subtask.
+    const dagResult = resultFor(1)
+    assert(Boolean(dagResult), "valid plan_dag call produced no tool result", problems)
+    let dagOk = false
+    try {
+      dagOk = dagResult !== null && JSON.stringify(JSON.parse(dagResult.content).waves[0]).includes("MX1")
+    } catch {}
+    assert(dagOk, `valid plan_dag call did not return bounded waves containing MX1: ${dagResult?.content?.slice(0, 300) ?? "no result"}`, problems)
+
+    // (c+d) format and semantic negatives: each rejected at the corresponding
+    // gate, with an actionable diagnostic and no write (the plan tools never
+    // write; rejection text is captured verbatim as evidence).
+    const matrixNegatives = {}
+    // ponytail: per-host double-encoded expectations are pinned intentionally —
+    // v1 = strict JSON-encoded-string rejection (kept in this negative loop),
+    // v2 = host pre-coercion (literal behavior pin below); if a host changes
+    // either, the corresponding assertion fails and CI flags it.
+    const pinV2Coercion = host.line === "v2"
+    for (const stepIndex of Object.keys(MATRIX_STEP_EXPECTATIONS).map(Number)) {
+      if (stepIndex === 4 && pinV2Coercion) continue
+      const r = resultFor(stepIndex)
+      const tool = stepIndex >= 13 ? "plan_dag" : stepIndex >= MATRIX_NEGATIVE_START && stepIndex <= 12 && stepIndex >= 7 ? "plan_readiness" : "plan_dag"
+      assert(Boolean(r), `negative step ${stepIndex} produced no tool result`, problems)
+      if (r) {
+        const pattern = HOST_ARGUMENT_REJECTIONS[stepIndex]
+          ? new RegExp(`${MATRIX_STEP_EXPECTATIONS[stepIndex].source}|${HOST_ARGUMENT_REJECTIONS[stepIndex].source}`)
+          : MATRIX_STEP_EXPECTATIONS[stepIndex]
+        const matched = pattern.test(r.content)
+        assert(matched, `negative step ${stepIndex} lacked the expected diagnostic: ${r.content.slice(0, 400)}`, problems)
+        matrixNegatives[stepIndex] = { tool, label: MATRIX_STEP_LABELS[stepIndex] ?? null, rejected: matched, diagnosticExcerpt: r.content.slice(0, 400) }
+      } else {
+        matrixNegatives[stepIndex] = { tool, label: MATRIX_STEP_LABELS[stepIndex] ?? null, rejected: false, diagnosticExcerpt: null }
+      }
+    }
+
+    // (e) Equivalent object call (step 17): the SAME documented fixture as an
+    // object, completing through real host execution on every case. It is the
+    // live reference the v2 double-encoded pin compares its results against,
+    // and on v1 it proves the object contract works while the string is
+    // rejected.
+    const objectCall = resultFor(17)
+    assert(Boolean(objectCall), "equivalent object plan_dag call (step 17) produced no tool result", problems)
+    let objectCallOk = false
+    try {
+      objectCallOk = objectCall !== null && Array.isArray(JSON.parse(objectCall.content).waves)
+    } catch {}
+    assert(objectCallOk, `equivalent object plan_dag call (step 17) did not complete with waves: ${objectCall?.content?.slice(0, 300) ?? "no result"}`, problems)
+
+    // (f) v2 double-encoded JSON-string behavior pin (tripwire; user decision
+    // 2026-10-22). ponytail: pinned intentionally — v1 must reject the
+    // double-encoded string with the shared runtime diagnostic (negative step
+    // 4 in the loop above), while v2.0.30 normalizes JSON-string tool
+    // arguments pre-plugin and the coerced object still faces every
+    // readiness/DAG/validation gate. Asserted literally against host behavior:
+    // (a) the string call completes with waves AND equals the equivalent
+    // object call (step 17) result, and (b) that equality+completion IS the
+    // pinned host behavior. If any future host stops coercing (string arrives
+    // raw -> rejection) or otherwise changes it, these assertions fail so CI
+    // flags the change and a documented re-verification is required.
+    let doubleEncodedPin
+    if (pinV2Coercion) {
+      const coerced = resultFor(4)
+      assert(Boolean(coerced), "v2 double-encoded pin: string-payload call produced no tool result", problems)
+      let coercedOk = false
+      let matchesObjectCall = false
+      try {
+        const coercedParsed = JSON.parse(coerced.content)
+        coercedOk = Array.isArray(coercedParsed.waves) && Array.isArray(coercedParsed.nodes)
+        matchesObjectCall =
+          objectCall !== null &&
+          JSON.stringify(coercedParsed) === JSON.stringify(JSON.parse(objectCall.content))
+      } catch {}
+      assert(coercedOk, `v2 double-encoded tripwire: host no longer completes the double-encoded JSON-string call (coercion removed or changed): ${coerced?.content?.slice(0, 300) ?? "no result"}`, problems)
+      assert(matchesObjectCall, "v2 double-encoded tripwire: coerced-string result no longer matches the equivalent object call (waves/nodes must be identical)", problems)
+      doubleEncodedPin = {
+        pinned: true,
+        completed: coercedOk,
+        matchesObjectCall,
+        behavior: "v2.0.30 normalizes JSON-string tool arguments before the plugin receives them; the coerced object is submitted to every readiness/DAG/validation gate",
+        resultExcerpt: coerced?.content?.slice(0, 200) ?? null,
+      }
+    } else {
+      doubleEncodedPin = {
+        pinned: false,
+        completed: false,
+        matchesObjectCall: false,
+        behavior: "v1 keeps the strict JSON-encoded-string (double-encoded) runtime diagnostic",
+      }
+    }
+
+    // Clean scripted round trip: final assistant text and clean host exit.
+    let roundTrip = false
+    try {
+      roundTrip = readFileSync(join(paths.logs, `matrix-${matrixCase.key}-run.out`), "utf8").includes(MATRIX_FINAL_TEXT)
+    } catch {}
+    assert(roundTrip, "final assistant text missing from the matrix run output", problems)
+    assert(runRes.status === 0, `host run exited ${runRes.status}`, problems)
+
+    results.push({
+      host: host.id,
+      pkg: host.pkg,
+      line: host.line,
+      key: matrixCase.key,
+      dialect: matrixCase.dialect,
+      stage: "matrix",
+      ok: problems.length === 0,
+      status: problems.length === 0 ? "pass" : "fail",
+      problems,
+      hostBinary: bin,
+      hostVersion: version,
+      fixtureDir,
+      projectDir,
+      evidenceDir,
+      providerToolNames,
+      boundedToolCount: boundedNames.length,
+      validCalls: { planReadiness: readinessOk, planDag: dagOk },
+      negatives: matrixNegatives,
+      doubleEncodedPin,
+      schemaCapturePath: join(evidenceDir, "plan-tool-schemas.json"),
+      finalTextSeen: roundTrip,
+    })
+  }
+
+  return results
+}
+
+// ---------------------------------------------------------------------------
 // C07 delegation stage: managed role topology, hidden-role dispatch, forbidden
 // chains and host session depth on the pinned real hosts. Config-only harness:
 // managed agents + permission maps + dialect depth key written into an isolated
@@ -1154,31 +1627,34 @@ async function runPackageStage() {
 async function main() {
   const stageIndex = process.argv.indexOf("--stage")
   const stage = stageIndex >= 0 ? process.argv[stageIndex + 1] : "loader"
-  if (!["loader", "v1", "package", "delegation", "all"].includes(stage)) {
-    process.stderr.write(`Unknown stage: ${stage}. Supported: loader, v1, delegation, package, all\n`)
+  if (!["loader", "v1", "matrix", "delegation", "package", "all"].includes(stage)) {
+    process.stderr.write(`Unknown stage: ${stage}. Supported: loader, v1, matrix, delegation, package, all\n`)
     process.exit(2)
   }
 
   const runLoader = stage === "loader" || stage === "all"
   const runV1 = stage === "v1" || stage === "all"
+  const runMatrix = stage === "matrix" || stage === "all"
   const runDelegation = stage === "delegation" || stage === "all"
   const runPackage = stage === "package" || stage === "all"
 
   let loaderResults = []
   let v1Results = []
+  let matrixResults = []
   let delegationResults = []
   if (runLoader) loaderResults = await runLoaderStage()
   if (runV1) v1Results = await runV1Stage()
+  if (runMatrix) matrixResults = await runMatrixStage()
   if (runDelegation) delegationResults = await runDelegationStage()
   const packageResults = runPackage ? await runPackageStage() : []
 
-  // v1-only runs keep the loader-stage host results from the previous report so
-  // the merged report still counts all three loader hosts alongside the v1 gate.
+  // Stage-only runs (v1/matrix) keep the loader-stage host results from the
+  // previous report so the merged report still counts all three loader hosts.
   let carriedLoader = false
-  if (!runLoader && runV1) {
+  if (!runLoader && (runV1 || runMatrix)) {
     try {
       const previous = JSON.parse(readFileSync(paths.report, "utf8"))
-      if (Array.isArray(previous.hosts) && previous.hosts.length > 0) {
+      if (Array.isArray(previous.hosts) && previous.hosts.length > 0 && previous.hosts.every((h) => h.line)) {
         loaderResults = previous.hosts
         carriedLoader = true
       }
@@ -1188,8 +1664,11 @@ async function main() {
   const allOk =
     (runLoader ? loaderResults.every((r) => r.ok) : true) &&
     (runV1 ? v1Results.every((r) => r.ok) : true) &&
+    (runMatrix ? matrixResults.every((r) => r.ok) : true) &&
     (runDelegation ? delegationResults.every((r) => r.ok) : true) &&
     (runPackage ? packageResults.every((r) => r.ok) : true)
+
+  const checksums = collectChecksums(loaderResults, matrixResults, packageResults)
 
   const summary = {
     stage,
@@ -1197,19 +1676,28 @@ async function main() {
     node: process.version,
     allOk,
     hosts: loaderResults,
+    checksums,
     ...(runPackage ? { packageStage: packageResults, packageCounts: {
       loader: { ran: runLoader, total: loaderResults.length, passed: loaderResults.filter((r) => r.ok).length },
       package: { ran: runPackage, total: packageResults.length, passed: packageResults.filter((r) => r.ok).length },
     } } : {}),
-    ...(runV1 && !runLoader ? { hostsSource: carriedLoader ? "carried-from-previous-report" : "none" } : {}),
+    ...(!runLoader && (runV1 || runMatrix) ? { hostsSource: carriedLoader ? "carried-from-previous-report" : "none" } : {}),
     ...(runV1 ? { v1: v1Results, v1Counts: {
       v1: { ran: runV1, total: v1Results.length, passed: v1Results.filter((r) => r.ok).length },
+    } } : {}),
+    ...(runMatrix ? { matrix: matrixResults, matrixCounts: {
+      matrix: { ran: runMatrix, total: matrixResults.length, passed: matrixResults.filter((r) => r.ok).length },
     } } : {}),
     ...(runDelegation ? { delegation: delegationResults, delegationCounts: {
       delegation: { ran: runDelegation, total: delegationResults.length, passed: delegationResults.filter((r) => r.ok).length },
     } } : {}),
   }
   writeFileSync(paths.report, `${JSON.stringify(summary, null, 2)}\n`)
+
+  if (stage === "all") {
+    const reportPath = writeCompatibilityReport(summary)
+    log(`compatibility report: ${reportPath}`)
+  }
 
   if (runLoader) {
     for (const r of loaderResults) {
@@ -1219,6 +1707,11 @@ async function main() {
   if (runV1) {
     for (const r of v1Results) {
       log(`v1 ${r.ok ? "PASS" : "FAIL"} ${r.host} (${r.hostVersion ?? "?"}) ${r.ok ? "" : "problems: " + r.problems.join("; ")}`)
+    }
+  }
+  if (runMatrix) {
+    for (const r of matrixResults) {
+      log(`matrix ${(r.ok ? "PASS" : (r.status ?? "FAIL").toUpperCase())} ${r.key} (${r.hostVersion ?? r.error ?? "?"}) ${r.ok ? "" : "problems: " + (r.problems ?? [r.error]).join("; ")}`)
     }
   }
   if (runPackage) {
@@ -1233,6 +1726,173 @@ async function main() {
   }
   log(`report: ${paths.report}`)
   process.exit(summary.allOk ? 0 : 1)
+}
+
+// sha256 over the pinned host binaries (the real host package artifacts on
+// disk) and the npm-packed project tarball, recorded into the report output.
+function collectChecksums(loaderResults, matrixResults, packageResults) {
+  const checksums = { hosts: [], projectTarball: null }
+
+  const seenHosts = new Set()
+  for (const r of [...loaderResults, ...matrixResults]) {
+    if (seenHosts.has(r.host) || !r.hostBinary || !existsSync(r.hostBinary)) continue
+    seenHosts.add(r.host)
+    checksums.hosts.push({ host: r.host, pkg: r.pkg ?? null, path: r.hostBinary, sha256: sha256File(r.hostBinary), bytes: statSync(r.hostBinary).size })
+  }
+  // A checksum-before-staging run still reports the cached pinned artifacts.
+  for (const host of HOSTS) {
+    if (seenHosts.has(host.id)) continue
+    const detected = detectHostBinary(host)
+    if (detected) {
+      checksums.hosts.push({ host: host.id, pkg: host.pkg, path: detected, sha256: sha256File(detected), bytes: statSync(detected).size })
+    }
+  }
+
+  const tarballFromRun = packageResults.find((r) => r.case === "npm-pack" && r.tarball)
+  const packDir = join(PKG_STAGE, "pack")
+  const tarballName = tarballFromRun?.tarball
+    ?? (() => {
+      try {
+        return readdirSync(packDir).filter((f) => f.endsWith(".tgz")).sort().at(-1) ?? null
+      } catch { return null }
+    })()
+  if (tarballName) {
+    const tarballPath = join(packDir, tarballName)
+    if (existsSync(tarballPath)) {
+      checksums.projectTarball = { path: tarballPath, sha256: sha256File(tarballPath), bytes: statSync(tarballPath).size }
+    }
+  }
+  return checksums
+}
+
+function detectHostBinary(host) {
+  const dir = join(paths.hosts, host.id)
+  for (const bin of [join(dir, "node_modules", "opencode-ai", "bin", "opencode.exe"), join(dir, "node_modules", "@opencode", "cli", "bin", "opencode.exe")]) {
+    if (existsSync(bin) && statSync(bin).size > 1_000_000) return bin
+  }
+  return null
+}
+
+// Consolidated English compatibility report for --stage all (C09 :643).
+function writeCompatibilityReport(summary) {
+  const reportPath = join(SCROOT, "compatibility-report.md")
+  const lines = []
+  const rel = (p) => p ? p.replace(REPO_ROOT + "/", "") : "(unavailable)"
+  const statusWord = (r) => (r.status === "blocked" ? "BLOCKED" : r.ok ? "PASS" : "FAIL")
+  const rc = (key) => summary.checksums?.hosts?.find((h) => h.host === key)?.sha256?.slice(0, 16) ?? "n/a"
+
+  lines.push(`# OpenCode v1/v2 Real-Host Compatibility Report (C09)`)
+  lines.push("")
+  lines.push(`Generated: ${summary.ranAt} · Node ${summary.node} · runner: \`node scripts/test-opencode-compat.mjs --stage all\` · overall: **${summary.allOk ? "ALL PASS" : "NOT ALL PASS"}**`)
+  lines.push("")
+
+  lines.push(`## Exact host versions`)
+  lines.push("")
+  lines.push(`| host | package | line | version | artifact sha256 (16) |`)
+  lines.push(`|---|---|---|---|---|`)
+  for (const r of summary.hosts ?? []) {
+    lines.push(`| ${r.host} | ${r.pkg} | ${r.line} | ${r.hostVersion ?? "?"} | \`${rc(r.host)}\` |`)
+  }
+  lines.push("")
+
+  lines.push(`## Real-plugin matrix results (5 mandatory host/config cases)`)
+  lines.push("")
+  lines.push(`| case | host | config dialect | result | evidence |`)
+  lines.push(`|---|---|---|---|---|`)
+  for (const r of summary.matrix ?? []) {
+    lines.push(`| ${r.key} | ${r.host} (${r.hostVersion ?? "?"}) | ${r.dialect} | **${statusWord(r)}** | ${rel(r.evidenceDir)} |`)
+  }
+  lines.push("")
+  for (const r of summary.matrix ?? []) {
+    if (r.ok) continue
+    for (const [stepIndex, negative] of Object.entries(r.negatives ?? {})) {
+      if (negative.rejected) continue
+      lines.push(`- **${r.key} ${statusWord(r)}** — ${MATRIX_STEP_LABELS[stepIndex] ?? `negative step ${stepIndex}`}: expected rejection not confirmed on ${r.host} (${r.hostVersion ?? "?"}) via ${r.dialect} config. Outcome excerpt: ${String(negative.diagnosticExcerpt ?? "").replace(/\s+/g, " ").slice(0, 220)}`)
+    }
+    for (const p of r.problems ?? []) {
+      if (!/^negative step \d+/.test(p)) lines.push(`- **${r.key} ${statusWord(r)}** — ${p.slice(0, 400)}`)
+    }
+  }
+  lines.push("")
+
+  lines.push(`### Documented limitation: v2 double-encoded JSON-string tool arguments`)
+  lines.push("")
+  lines.push(`Per-host behavior for the double-encoded JSON-string plan payload is pinned by the compat runner (behavior pin / tripwire in \`scripts/test-opencode-compat.mjs\`):`)
+  lines.push("")
+  lines.push(`- **v2.0.30 normalizes JSON-string tool arguments before the plugin receives them.** The double-encoded call completes and returns the same waves/nodes as the equivalent object call (same documented fixture, adjacent script step), proving the coerced object is still submitted to every readiness/DAG/validation gate. Raw Markdown documents, array payloads, and wrapper payloads remain rejected by the host schema, and all ten semantic gates still return real \`executable: false\` diagnostics. Verified verbatim from host evidence (\`.liteagent/scratch/opencode-compat/evidence/matrix-v2.0.30-*\`), not assumed.`)
+  lines.push(`- **v1 hosts keep the strict diagnostic:** the double-encoded string is rejected with the shared runtime diagnostic ("\`payload\` was received as a JSON-encoded string (double-encoded input)… the plan tools never \`JSON.parse\` string input").`)
+  lines.push(`- **Tripwire:** this behavior is pinned — a future host that stops coercing (the string arrives raw and is rejected) or otherwise changes it makes the matrix stage fail and flags the change in CI, requiring a documented re-verification before any support claim is updated.`)
+  lines.push("")
+
+  const counts = (rr) => `${rr.filter((r) => r.ok).length}/${rr.length} passed`
+  lines.push(`## Stage overview`)
+  lines.push("")
+  lines.push(`- loader (dual-directory entrypoint + deterministic echo round trip): ${counts(summary.hosts ?? [])}`)
+  lines.push(`- matrix (real plugin, 5 host/config cases): ${counts(summary.matrix ?? [])}`)
+  lines.push(`- delegation (C07 role topology, 3 hosts × ${DELEGATION_CASES.length} cases): ${summary.delegation ? counts(summary.delegation) : "not run"}`)
+  lines.push(`- package (C06 source + tarball install gates): ${summary.packageStage ? counts(summary.packageStage) : "not run"}`)
+  lines.push("")
+
+  lines.push(`## Provider-visible plan-tool JSON Schemas (captured from live provider payloads)`)
+  lines.push("")
+  for (const rep of [summary.matrix?.find((r) => r.line === "v1"), summary.matrix?.find((r) => r.line === "v2")]) {
+    if (!rep) continue
+    lines.push(`### ${rep.host} (${rep.dialect} config)`)
+    lines.push("")
+    let schemas = null
+    try { schemas = JSON.parse(readFileSync(join(rep.evidenceDir, "plan-tool-schemas.json"), "utf8")) } catch {}
+    if (!schemas || !schemas.toolSchemas.bounded_lite_plan_dag) {
+      lines.push(`Schema capture missing/unavailable — see ${rel(join(rep.evidenceDir, "plan-tool-schemas.json"))} and running problems: ${(rep.problems ?? []).join("; ")}`)
+    } else {
+      for (const [tool, schema] of Object.entries(schemas.toolSchemas)) {
+        lines.push(`**${tool}**:`)
+        lines.push("")
+        lines.push("```json")
+        lines.push(JSON.stringify(schema, null, 2))
+        lines.push("```")
+        lines.push("")
+      }
+    }
+  }
+
+  lines.push(`## Checksums`)
+  lines.push("")
+  for (const h of summary.checksums?.hosts ?? []) {
+    lines.push(`- ${h.host} (${h.pkg}): \`${h.sha256}\` → ${rel(h.path)} (${h.bytes} bytes)`)
+  }
+  if (summary.checksums?.projectTarball) {
+    const t = summary.checksums.projectTarball
+    lines.push(`- npm-packed project tarball: \`${t.sha256}\` → ${rel(t.path)} (${t.bytes} bytes)`)
+  } else {
+    lines.push(`- npm-packed project tarball: unavailable at report time`)
+  }
+  lines.push("")
+
+  lines.push(`## Verification commands`)
+  lines.push("")
+  lines.push("```sh")
+  lines.push("npm test          # full offline regression suite")
+  lines.push("npm run typecheck # TypeScript source typing")
+  lines.push("npm run test:compat                                 # this matrix (same as --stage all)")
+  lines.push("node scripts/test-opencode-compat.mjs --stage all   # this matrix")
+  lines.push("node scripts/test-opencode-compat.mjs --stage loader|v1|matrix|delegation|package  # individual stages")
+  lines.push("```")
+  lines.push("")
+  lines.push(`Per-case evidence: \`.liteagent/scratch/opencode-compat/evidence/<case>/\` (scripted provider request logs, plan-tool schema captures, run stdout/stderr at \`.liteagent/scratch/opencode-compat/logs/\`); consolidated machine results in \`.liteagent/scratch/opencode-compat/report.json\`.`)
+  lines.push("")
+
+  lines.push(`## Limitations (honest scope of this report)`)
+  lines.push("")
+  lines.push(`- This runner is POSIX-only (Linux): host invocation, process-kill and path primitives are POSIX; every host case runs with a pinned isolated environment (\`HOME\`/\`XDG\`/\`TMPDIR\`/npm cache inside the scratch root, PATH reduced to \`/usr/bin:/bin\`).`)
+  lines.push(`- **Windows actual-host coverage is NOT verified** and must not be claimed: no compatible official Windows host artifact was exercised (per plan verification_strategy 6, the packaging/OS limitation is recorded here instead). Installer-level and unit-level Windows coverage exists in the offline suite only.`)
+  lines.push(`- All proof uses the deterministic scripted OpenAI-compatible provider; no real LLM and no real credentials involved.`)
+  lines.push(`- The staged real-plugin fixture resolves module imports against the plugin's own directory first; ancestor-repo \`node_modules\` may resolve fallbacks (documented staging caveat, consistent with prior C01/C03 loader/v1 stages).`)
+  lines.push(`- v1 hosts are intentionally never fed native-v2 config (plan C09 :632); mixed top-level config (both \`plugin\` and \`plugins\`) is exercised only on the v2 host.`)
+  lines.push(`- Hosts are exact npm pins (\`opencode-ai@1.18.29\`, \`opencode-ai@1.19.1\`, \`@opencode/cli@2.0.30\`); other versions are untested by this report.`)
+  lines.push("")
+
+  writeFileSync(reportPath, `${lines.join("\n")}\n`)
+  return reportPath
 }
 
 main().catch((error) => {

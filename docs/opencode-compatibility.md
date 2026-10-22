@@ -190,3 +190,35 @@ Classify the failure:
 3. **Missing named payload.** Error starts with ``Missing `payload` `` → the `payload` key was absent or empty; resubmit with the object (example above).
 4. **Invalid format.** One diagnostic naming raw Markdown / double-encoded string / array → apply the matching corrected call from the table above; the tools never parse strings or Markdown.
 5. **Semantic gate failure.** The payload was accepted and `bounded_lite_plan_readiness` returned `executable: false` with named errors (blocked status, M0/M1 maturity, blocking open question, unresolved major Plan Review finding, self-check blocker, unknown/duplicate/cyclic subtasks, missing sections) → fix the plan content, not the call format; do not strip the safety fields to make the error go away.
+
+## Verified real-host compatibility results (2026-10-22)
+
+The compat runner (`npm run test:compat`, equivalent to `node scripts/test-opencode-compat.mjs --stage all`) proved the real bounded-lite plugin on all five mandatory host/config cases with a deterministic scripted provider, isolated HOME/XDG/npm-cache state, no PATH fallback, and no credentials or real LLM. Overall result on 2026-10-22: **ALL PASS** — consolidated in `.liteagent/scratch/opencode-compat/compatibility-report.md` with machine results in `.liteagent/scratch/opencode-compat/report.json`.
+
+| case | host (exact version) | config dialect | result |
+| --- | --- | --- | --- |
+| v1.18.29-legacy | opencode-ai@1.18.29 (v1.18.29) | legacy `plugin` | PASS |
+| v1.19.1-legacy | opencode-ai@1.19.1 (v1.19.1) | legacy `plugin` | PASS |
+| v2.0.30-legacy | @opencode/cli@2.0.30 (v2.0.30) | legacy `plugin` | PASS |
+| v2.0.30-native | @opencode/cli@2.0.30 (v2.0.30) | native `plugins` | PASS |
+| v2.0.30-mixed | @opencode/cli@2.0.30 (v2.0.30) | mixed (`plugin` + `plugins`) | PASS |
+
+Per case the run proves: the nine provider-visible `bounded_lite_*` tools, the host-exported plan-tool JSON Schemas captured from live provider payloads, the documented plan object passing readiness with `executable: true` and DAG with bounded waves through real host execution, one actionable diagnostic per format/semantic negative, and the final scripted round trip.
+
+### Documented limitation: v2 double-encoded JSON-string tool arguments
+
+The format table above describes the plugin's own input validation, which every host passes through. One host-level difference is pinned by the runner:
+
+| v1 (1.18.29 / 1.19.1) | v2 (2.0.30) |
+| --- | --- |
+| Strict rejection: a JSON-encoded `payload` string arrives as a string and fails with the standard double-encoded diagnostic. | The host normalizes (parses) JSON-string tool arguments before the plugin receives them, so the same call completes and returns the same result as the equivalent object call. |
+
+The v2 coercion is not a bypass: the runner sends the double-encoded string and the equivalent object call of the same documented fixture, and the coerced result is identical (same waves/nodes), proving the full readiness/DAG/validation gates still apply to the coerced object. Raw Markdown documents, array payloads, and wrapper payloads remain rejected by the host schema on both host lines, and all ten semantic gates still return real `executable: false` diagnostics. This limitation is verified verbatim from host evidence (.liteagent/scratch/opencode-compat/evidence/matrix-v2.0.30-*), not assumed.
+
+**Warning — behavior pin (tripwire):** the compat runner pins the per-host double-encoded behavior intentionally: v1 hosts must keep the strict JSON-encoded-string rejection, and the v2.0.30 host must keep its pre-coercion. If any future host changes either (for example, a v2 build stops normalizing string arguments and rejects them raw), the matrix stage fails and CI flags it. A documented re-verification of the new behavior is then required before any support claim is updated.
+
+### Reproducing and inspecting the results
+
+Reproduce with `npm run test:compat` from the repository source. The consolidated machine report is `.liteagent/scratch/opencode-compat/report.json` (top-level `allOk: true`; matrix 5/5 passed); the human-readable report links each case's evidence directory (`.liteagent/scratch/opencode-compat/evidence/<case>/`), per-host run stdout/stderr (`.liteagent/scratch/opencode-compat/logs/`), and the exact host binary sha256 checksums keyed to the pinned npm packages (`opencode-ai@1.18.29`, `opencode-ai@1.19.1`, `@opencode/cli@2.0.30`).
+
+Known limitation of this verification: the compat runner is POSIX-only (Linux). Windows actual-host coverage is NOT verified — no compatible official Windows host artifact was exercised; installer-level and unit-level Windows coverage exists in the offline suite only.

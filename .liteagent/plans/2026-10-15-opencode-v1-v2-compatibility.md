@@ -4,9 +4,9 @@ plan_id: opencode-v1-v2-compatibility-20261015
 title: Dual OpenCode v1/v2 support and reliable plan validation
 maturity_level: M3
 status: reviewed
-active_node: C09 (Phase 4 — next; Phase 3 C07+C08 complete 2026-10-22 uncommitted)
+active_node: complete (C09/Phase 4 complete 2026-10-22, uncommitted)
 generated_by: deep_plan_builder
-updated_at: 2026-10-22T12:00:00Z
+updated_at: 2026-10-22T23:30:00Z
 recommended_plan_path: .liteagent/plans/2026-10-15-opencode-v1-v2-compatibility.md
 ---
 
@@ -233,6 +233,8 @@ Additional direct facts:
 12. Retain `MAX_CHILD_ORCHESTRATOR_DEPTH = 1`. Separately set/verify the host's bounded **session depth** sufficient for existing allowed chains (v2 `experimental.subagent_depth: 3`) while retaining role allowlists and no further child orchestrator delegation. Do not silently raise a user's explicit stricter depth limit; report a compatibility blocker with the exact failing chain and required change.
 13. Preserve hidden internal roles. Add only the permitted hidden-role IDs/descriptions to model-visible delegation guidance/tool descriptions; do not make roles visible to solve v2 catalog omissions.
 14. Lite-config reasoning preferences must affect actual requests on supported models. V2 agent `request.body` is not accepted as proof. Prefer an explicitly configured, catalog-verified `#variant`; when no explicit variant exists, apply supported semantic options through a typed request hook. Explicit variants take precedence over conflicting stored effort and produce a warning. Profile recommendations remain advisory unless a verified runtime override is explicitly supported.
+15. **[User Confirmed 2026-10-22]** C09 evidence showed the v2.0.30 host normalizes valid-JSON string tool arguments into objects before the plugin receives them, so the C02 double-encoded negative cannot be enforced at the plugin boundary on v2. Accepted as a documented, verified host capability with no safety bypass: the coerced object still passes every readiness/DAG gate, raw Markdown/arrays/wrappers remain host-rejected, and v1 keeps the strict diagnostic. Phase 4 pins this exact per-host behavior with code-level tripwire assertions in the compat runner, so a future host change fails CI and requires documented re-verification.
+15. **[User Confirmed 2026-10-22]** The v2.0.30 host normalizes valid-JSON string tool arguments into objects before the plugin receives them, so the C02 double-encoded negative cannot be enforced at the plugin boundary on v2. Accepted as a documented, verified host capability with no safety bypass (the coerced object still passes every readiness/DAG/gate check; raw Markdown, arrays and wrappers remain host-rejected; v1 keeps the strict diagnostic). C09 pins this exact per-host behavior with code-level tripwire assertions in the compat runner, so a future host change fails CI and requires documented re-verification.
 
 ## execution_strategy
 
@@ -254,7 +256,7 @@ Additional direct facts:
 | 1: Fix shared boundaries | C02-C04 | ✅ done — C02 (`288d203`), C03 (`e09783e`), C04 complete 2026-10-20 (uncommitted: `.opencode/lib/compat/config.ts` + runtime/installer/test changes; 25 files / 260 tests + typecheck + read-only dry-run pass) | Plan calls have meaningful schemas/diagnostics; real v1 contexts work; configuration preserves effective legacy/native values and user data |
 | 2: Implement and deliver v2 | C05-C06 | ✅ done — complete 2026-10-20 (uncommitted: typed v2 adapter + combined export, staged runtime installer, 26 files / 295 tests + typecheck + loader/v1/package compat gates pass) | Separate typed v2 adapter and clean source/package installer path work without workspace dependencies |
 | 3: Preserve orchestration and guidance | C07-C08 | ✅ done — complete 2026-10-22 (uncommitted: delegation-edge parity lock, hidden-ID DELEGATION_GUIDANCE, dialect-aware host session depth 3 with stricter-user blocker docs, background-honesty test, `--stage delegation` runner gate 30/30 PASS on pinned hosts, English prompt/docs reconciliation + drift-lock test; 30 files / 315 tests + typecheck) | Hidden-role delegation, allowed nested chains, permissions, depth and English examples agree in both runtimes |
-| 4: Prove compatibility | C09 | ⬜ pending | Matrix, exported schemas, negative gates, packaged installs, rollback and existing regression suite pass; limitations are documented honestly |
+| 4: Prove compatibility | C09 | ✅ done — complete 2026-10-22 (uncommitted: `matrix` stage in compat runner covering all 5 host/config cases with real v2 plugin load, 18-step scripted per-case run, host-level readiness/negative gates, plan-tool schema capture, sha256 checksums, consolidated report.json allOk:true + compatibility-report.md; CI `compat` job + `test:compat` script + English docs results/limitations; 30 files / 315 tests + typecheck + build + pack:dry-run pass; [User Confirmed] v2 double-encoded-string coercion documented as host limitation with code-level tripwire) | Matrix, exported schemas, negative gates, packaged installs, rollback and existing regression suite pass; limitations are documented honestly |
 
 ### Structured validation payload / executable core
 

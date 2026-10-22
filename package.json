@@ -51,7 +51,8 @@
     "publish:dry-run": "npm publish --dry-run",
     "prepublishOnly": "npm test && npm run typecheck && npm run pack:dry-run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:compat": "node scripts/test-opencode-compat.mjs --stage all"
   },
   "devDependencies": {
     "@opencode/plugin": "2.0.30",
