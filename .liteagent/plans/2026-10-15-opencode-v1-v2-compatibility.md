@@ -4,9 +4,9 @@ plan_id: opencode-v1-v2-compatibility-20261015
 title: Dual OpenCode v1/v2 support and reliable plan validation
 maturity_level: M3
 status: reviewed
-active_node: C07+C08 (Phase 3 — next; Phase 2 C05+C06 complete 2026-10-20 uncommitted)
+active_node: C09 (Phase 4 — next; Phase 3 C07+C08 complete 2026-10-22 uncommitted)
 generated_by: deep_plan_builder
-updated_at: 2026-10-20T00:00:00Z
+updated_at: 2026-10-22T12:00:00Z
 recommended_plan_path: .liteagent/plans/2026-10-15-opencode-v1-v2-compatibility.md
 ---
 
@@ -253,7 +253,7 @@ Additional direct facts:
 | 0: Establish the real contracts | C01 | ✅ done (commit `6c42a03`) | Official host binaries are isolated; one dual directory entrypoint and dependency-resolution spike passes all three host versions, or implementation stops with a precise blocker |
 | 1: Fix shared boundaries | C02-C04 | ✅ done — C02 (`288d203`), C03 (`e09783e`), C04 complete 2026-10-20 (uncommitted: `.opencode/lib/compat/config.ts` + runtime/installer/test changes; 25 files / 260 tests + typecheck + read-only dry-run pass) | Plan calls have meaningful schemas/diagnostics; real v1 contexts work; configuration preserves effective legacy/native values and user data |
 | 2: Implement and deliver v2 | C05-C06 | ✅ done — complete 2026-10-20 (uncommitted: typed v2 adapter + combined export, staged runtime installer, 26 files / 295 tests + typecheck + loader/v1/package compat gates pass) | Separate typed v2 adapter and clean source/package installer path work without workspace dependencies |
-| 3: Preserve orchestration and guidance | C07-C08 | ⬜ pending | Hidden-role delegation, allowed nested chains, permissions, depth and English examples agree in both runtimes |
+| 3: Preserve orchestration and guidance | C07-C08 | ✅ done — complete 2026-10-22 (uncommitted: delegation-edge parity lock, hidden-ID DELEGATION_GUIDANCE, dialect-aware host session depth 3 with stricter-user blocker docs, background-honesty test, `--stage delegation` runner gate 30/30 PASS on pinned hosts, English prompt/docs reconciliation + drift-lock test; 30 files / 315 tests + typecheck) | Hidden-role delegation, allowed nested chains, permissions, depth and English examples agree in both runtimes |
 | 4: Prove compatibility | C09 | ⬜ pending | Matrix, exported schemas, negative gates, packaged installs, rollback and existing regression suite pass; limitations are documented honestly |
 
 ### Structured validation payload / executable core
